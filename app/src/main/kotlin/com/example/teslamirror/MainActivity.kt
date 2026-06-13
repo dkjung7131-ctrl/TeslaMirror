@@ -159,11 +159,22 @@ fun HomeScreen() {
             .padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
-        Text(
-            "TeslaMirror",
-            fontSize = 40.sp,
-            fontWeight = FontWeight.Bold
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                "TeslaMirror",
+                fontSize = 40.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                "v$currentVersion",
+                fontSize = 16.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
         Text(
             "1) 폰 핫스팟 켜기\n" +
             "2) 테슬라 Wi-Fi를 폰 핫스팟에 연결\n" +
