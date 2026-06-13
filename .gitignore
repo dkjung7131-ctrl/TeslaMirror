@@ -1,0 +1,24 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+app/build/
+build/
+.kotlin/
+
+# Personal Claude Code context (real name / work background) — keep local only
+CLAUDE.md
+
+# Release signing material — never commit
+*.keystore
+*.jks
+keystore.properties
+
+# Local build/verify logs
+*.log

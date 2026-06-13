@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 다운로드한 업데이트 APK를 보관하는 위치 (context.cacheDir/updates) -->
+    <cache-path name="updates" path="updates/" />
+</paths>

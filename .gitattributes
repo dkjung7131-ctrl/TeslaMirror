@@ -1,0 +1,12 @@
+# 텍스트 파일은 저장소에 LF로 정규화 (Windows ↔ Linux CI 일관성)
+* text=auto eol=lf
+
+# gradlew는 반드시 LF — CI(ubuntu)에서 CRLF면 셸 해석이 깨진다
+gradlew text eol=lf
+gradlew.bat text eol=crlf
+
+# 바이너리
+*.jar binary
+*.keystore binary
+*.jks binary
+*.png binary

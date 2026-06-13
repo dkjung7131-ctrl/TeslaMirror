@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- TV/screen outline (rounded rectangle border) -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:fillColor="#00000000"
+        android:pathData="M28,30 L82,30 Q86,30 86,34 L86,74 Q86,78 82,78 L28,78 Q24,78 24,74 L24,34 Q24,30 28,30 Z"/>
+
+    <!-- Cast wave: dot at bottom-left corner of screen -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,72 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0"/>
+
+    <!-- Cast wave: small inner arc -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M30,62 A10,10 0 0,1 40,72"/>
+
+    <!-- Cast wave: outer arc -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M30,52 A20,20 0 0,1 50,72"/>
+
+    <!-- Tesla "T" mark in upper-right of screen -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M52,38 H78 V44 H68 V64 H62 V44 H52 Z"/>
+
+</vector>
