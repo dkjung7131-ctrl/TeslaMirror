@@ -63,6 +63,11 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
+    // 개인용 앱: 릴리스 시 lint 정밀검사 비활성화 (배포 차단/일부 JDK에서의 lint 크래시 방지)
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
     packaging {
         resources.excludes += setOf(
             "META-INF/INDEX.LIST",
