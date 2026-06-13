@@ -22,3 +22,6 @@ keystore.properties
 
 # Local build/verify logs
 *.log
+
+# Claude Code local config
+/.claude/
