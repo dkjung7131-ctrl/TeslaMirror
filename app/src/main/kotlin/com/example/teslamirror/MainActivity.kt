@@ -28,7 +28,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.teslamirror.update.UpdateChecker
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.net.NetworkInterface
 
 class MainActivity : ComponentActivity() {
@@ -62,6 +65,14 @@ fun HomeScreen() {
     // 앱 실행 시 1회 조용히 업데이트 확인 (실패는 무시)
     LaunchedEffect(Unit) {
         runCatching { UpdateChecker.checkForUpdate(context) }.getOrNull()?.let { updateInfo = it }
+    }
+
+    // 접속 URL을 2초마다 실시간 갱신 — Wi-Fi/핫스팟을 켜고 끄면 화면이 바로 따라감
+    LaunchedEffect(Unit) {
+        while (true) {
+            ipText = withContext(Dispatchers.IO) { currentLocalAddresses() }
+            delay(2000)
+        }
     }
 
     fun checkForUpdateManually() {
