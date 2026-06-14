@@ -313,34 +313,52 @@ fun HomeScreen() {
     }
 }
 
+private data class IpCandidate(val ip: String, val isHotspot: Boolean)
+
 private fun currentLocalAddresses(): String {
-    val ip = primaryLocalIp() ?: return "핫스팟을 켠 뒤 다시 시작하세요"
-    val portSuffix = if (HttpConfig.PORT == 80) "" else ":${HttpConfig.PORT}"
-    return "http://$ip$portSuffix"
+    val cands = localIpCandidates()
+    if (cands.isEmpty()) return "핫스팟(또는 Wi-Fi)을 켠 뒤 다시 시작하세요"
+    val port = if (HttpConfig.PORT == 80) "" else ":${HttpConfig.PORT}"
+    val hotspot = cands.filter { it.isHotspot }
+    val others = cands.filter { !it.isHotspot }
+    val sb = StringBuilder()
+    if (hotspot.isNotEmpty()) {
+        sb.append("▶ 테슬라(핫스팟)용:\n")
+        hotspot.forEach { sb.append("http://${it.ip}$port\n") }
+    }
+    if (others.isNotEmpty()) {
+        if (hotspot.isNotEmpty()) sb.append("\n")
+        sb.append("같은 Wi-Fi 테스트용:\n")
+        others.forEach { sb.append("http://${it.ip}$port\n") }
+    }
+    return sb.toString().trimEnd()
 }
 
-private fun primaryLocalIp(): String? {
+/**
+ * 접속 가능한 모든 로컬 IP 후보. 핫스팟 인터페이스(테슬라가 붙는 쪽)를 먼저.
+ * 폰이 핫스팟 + 일반 Wi-Fi에 동시 연결된 경우(삼성 Wi-Fi 공유) 둘 다 노출해
+ * 사용자가 맞는 주소를 고를 수 있게 한다.
+ */
+private fun localIpCandidates(): List<IpCandidate> {
     return try {
-        val candidates = NetworkInterface.getNetworkInterfaces().toList()
+        NetworkInterface.getNetworkInterfaces().toList()
             .filter { it.isUp && !it.isLoopback }
-            .filter { ni ->
-                // Wi-Fi 계열만 화이트리스트 — 셀룰러(rmnet, seth_*)는 자동 제외
-                val name = ni.name.lowercase()
-                name.startsWith("wlan") || name.startsWith("ap") ||
-                    name.startsWith("softap") || name.startsWith("swlan") ||
-                    name.startsWith("p2p") || name.startsWith("tether")
-            }
             .flatMap { ni ->
+                val name = ni.name.lowercase()
+                val isHotspot = name.startsWith("ap") || name.startsWith("softap") ||
+                    name.startsWith("swlan") || name.startsWith("rndis") ||
+                    name.startsWith("tether") || name.startsWith("p2p") || name == "wlan1"
+                val isWifiClient = name.startsWith("wlan")
+                // Wi-Fi 계열만 — 셀룰러(rmnet, seth_*)는 제외
+                if (!isHotspot && !isWifiClient) return@flatMap emptyList()
                 ni.inetAddresses.toList()
                     .filter { !it.isLinkLocalAddress && it.hostAddress?.contains(':') == false }
-                    .map { ni.name to it.hostAddress!! }
+                    .map { IpCandidate(it.hostAddress!!, isHotspot) }
             }
-        // 일반 Wi-Fi 클라이언트(wlan0) 우선 → PC 테스트 시 자연스러운 IP.
-        // 없으면 핫스팟 인터페이스(ap/swlan 등)의 첫번째 → 운전 시 테슬라 접속용.
-        candidates.firstOrNull { it.first.lowercase().startsWith("wlan") }?.second
-            ?: candidates.firstOrNull()?.second
+            .distinctBy { it.ip }
+            .sortedByDescending { it.isHotspot }   // 핫스팟 IP 먼저
     } catch (_: Exception) {
-        null
+        emptyList()
     }
 }
 
