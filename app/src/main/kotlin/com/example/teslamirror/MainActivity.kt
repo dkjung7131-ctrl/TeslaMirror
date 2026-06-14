@@ -324,30 +324,21 @@ fun HomeScreen() {
     }
 }
 
-private data class IpCandidate(val iface: String, val ip: String, val isHotspot: Boolean)
+private data class IpCandidate(val ip: String, val isHotspot: Boolean)
 
 private fun currentLocalAddresses(): String {
     val cands = localIpCandidates()
-    if (cands.isEmpty()) return "네트워크(핫스팟/Wi-Fi)를 켠 뒤 다시 시작하세요"
     val port = if (HttpConfig.PORT == 80) "" else ":${HttpConfig.PORT}"
     val hotspot = cands.filter { it.isHotspot }
-    val others = cands.filter { !it.isHotspot }
-    val sb = StringBuilder()
-    if (hotspot.isNotEmpty()) {
-        sb.append("▶ 테슬라(핫스팟)용:\n")
-        hotspot.forEach { sb.append("http://${it.ip}$port  (${it.iface})\n") }
-    }
-    if (others.isNotEmpty()) {
-        if (hotspot.isNotEmpty()) sb.append("\n")
-        sb.append("기타:\n")
-        others.forEach { sb.append("http://${it.ip}$port  (${it.iface})\n") }
-    }
-    return sb.toString().trimEnd()
+    // 핫스팟이 켜져 있으면 핫스팟 주소만, 없으면 일반 Wi-Fi 주소를 보여준다.
+    val show = hotspot.ifEmpty { cands }
+    if (show.isEmpty()) return "핫스팟을 켠 뒤 다시 시작하세요"
+    return show.joinToString("\n") { "http://${it.ip}$port" }
 }
 
 /**
- * 접속 가능한 모든 로컬 IPv4 주소 + 인터페이스 이름. 핫스팟 추정 인터페이스를 먼저.
- * 진단을 위해 셀룰러 포함 전부 노출하고, 어느 인터페이스인지 이름을 함께 표시한다.
+ * 접속 가능한 로컬 IPv4 주소. 핫스팟(테슬라가 붙는 쪽)을 먼저.
+ * 셀룰러(rmnet 등)는 테슬라가 닿을 수 없으므로 제외한다.
  */
 private fun localIpCandidates(): List<IpCandidate> {
     return try {
@@ -358,12 +349,14 @@ private fun localIpCandidates(): List<IpCandidate> {
                 val isHotspot = name.startsWith("ap") || name.startsWith("softap") ||
                     name.startsWith("swlan") || name.startsWith("rndis") ||
                     name.startsWith("tether") || name.startsWith("p2p") || name == "wlan1"
+                val isWifiClient = name.startsWith("wlan") && !isHotspot
+                if (!isHotspot && !isWifiClient) return@flatMap emptyList()
                 ni.inetAddresses.toList()
                     .filter { !it.isLinkLocalAddress && it.hostAddress?.contains(':') == false }
-                    .map { IpCandidate(ni.name, it.hostAddress!!, isHotspot) }
+                    .map { IpCandidate(it.hostAddress!!, isHotspot) }
             }
             .distinctBy { it.ip }
-            .sortedByDescending { it.isHotspot }   // 핫스팟 추정 먼저
+            .sortedByDescending { it.isHotspot }   // 핫스팟 먼저
     } catch (_: Exception) {
         emptyList()
     }
