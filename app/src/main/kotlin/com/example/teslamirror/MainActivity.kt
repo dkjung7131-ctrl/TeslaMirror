@@ -59,9 +59,8 @@ fun HomeScreen() {
     var fps by remember { mutableStateOf(30) }
     var ipText by remember { mutableStateOf("확인 중…") }
 
-    // DuckDNS 설정 — 저장된 값은 폰에만 있음 (SharedPreferences)
-    var ddnsDomain by remember { mutableStateOf(DuckDnsUpdater.domain(context)) }
-    var ddnsDomainField by remember { mutableStateOf(DuckDnsUpdater.domain(context)) }
+    // DuckDNS 토큰 — 저장된 값은 폰에만 있음 (SharedPreferences). 도메인은 코드에 고정.
+    var ddnsConfigured by remember { mutableStateOf(DuckDnsUpdater.isConfigured(context)) }
     var ddnsTokenField by remember { mutableStateOf(DuckDnsUpdater.token(context)) }
     var ddnsStatus by remember { mutableStateOf<String?>(null) }
 
@@ -80,7 +79,7 @@ fun HomeScreen() {
     LaunchedEffect(Unit) {
         while (true) {
             val cands = withContext(Dispatchers.IO) { localIpCandidates() }
-            ipText = formatViewerUrls(cands, ddnsDomain)
+            ipText = formatViewerUrls(cands, showDomain = ddnsConfigured)
             val hotspotIp = cands.firstOrNull { it.isHotspot }?.ip
             if (hotspotIp != null) {
                 DuckDnsUpdater.pushIfChanged(context, hotspotIp)?.let { ddnsStatus = it }
@@ -173,7 +172,7 @@ fun HomeScreen() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             ScreenCaptureService.start(context, result.resultCode, result.data!!, fps)
-            ipText = formatViewerUrls(localIpCandidates(), ddnsDomain)
+            ipText = formatViewerUrls(localIpCandidates(), showDomain = ddnsConfigured)
         }
     }
 
@@ -317,21 +316,14 @@ fun HomeScreen() {
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    "DuckDNS 자동 갱신 (선택)",
+                    "DuckDNS 자동 갱신",
                     fontSize = 22.sp,
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    "설정하면 핫스팟 IP가 바뀌어도 테슬라에서는 항상 같은 도메인으로 접속할 수 있습니다.",
+                    "토큰을 저장하면 핫스팟 IP가 바뀔 때마다 ${DuckDnsUpdater.DOMAIN}.duckdns.org가 자동으로 따라옵니다.",
                     fontSize = 15.sp,
                     lineHeight = 22.sp
-                )
-                OutlinedTextField(
-                    value = ddnsDomainField,
-                    onValueChange = { ddnsDomainField = it },
-                    label = { Text("도메인 (예: teslamirror)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     value = ddnsTokenField,
@@ -343,14 +335,13 @@ fun HomeScreen() {
                 )
                 Button(
                     onClick = {
-                        DuckDnsUpdater.save(context, ddnsDomainField, ddnsTokenField)
-                        ddnsDomain = DuckDnsUpdater.domain(context)
-                        ddnsDomainField = ddnsDomain
+                        DuckDnsUpdater.save(context, ddnsTokenField)
+                        ddnsConfigured = DuckDnsUpdater.isConfigured(context)
                         ddnsStatus = null
                         Toast.makeText(
                             context,
-                            if (DuckDnsUpdater.isConfigured(context)) "저장됨 — 핫스팟이 켜지면 자동 갱신됩니다"
-                            else "저장됨 — 도메인/토큰이 비어 있어 자동 갱신은 꺼집니다",
+                            if (ddnsConfigured) "저장됨 — 핫스팟이 켜지면 자동 갱신됩니다"
+                            else "저장됨 — 토큰이 비어 있어 자동 갱신은 꺼집니다",
                             Toast.LENGTH_SHORT
                         ).show()
                     },
@@ -391,16 +382,16 @@ fun HomeScreen() {
 
 private data class IpCandidate(val ip: String, val isHotspot: Boolean)
 
-private fun formatViewerUrls(cands: List<IpCandidate>, ddnsDomain: String): String {
+private fun formatViewerUrls(cands: List<IpCandidate>, showDomain: Boolean): String {
     val port = if (HttpConfig.PORT == 80) "" else ":${HttpConfig.PORT}"
     val hotspot = cands.filter { it.isHotspot }
     // 핫스팟이 켜져 있으면 핫스팟 주소만, 없으면 일반 Wi-Fi 주소를 보여준다.
     val show = hotspot.ifEmpty { cands }
     if (show.isEmpty()) return "핫스팟을 켠 뒤 다시 시작하세요"
     val urls = show.map { "http://${it.ip}$port" }.toMutableList()
-    // DuckDNS가 설정돼 있고 핫스팟이 살아 있으면 도메인 주소를 맨 위에 — 테슬라 북마크용
-    if (ddnsDomain.isNotBlank() && hotspot.isNotEmpty()) {
-        urls.add(0, "http://$ddnsDomain.duckdns.org$port")
+    // 토큰이 저장돼 있고 핫스팟이 살아 있으면 도메인 주소를 맨 위에 — 테슬라 북마크용
+    if (showDomain && hotspot.isNotEmpty()) {
+        urls.add(0, "http://${DuckDnsUpdater.DOMAIN}.duckdns.org$port")
     }
     return urls.joinToString("\n")
 }
