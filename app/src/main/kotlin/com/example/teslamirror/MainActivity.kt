@@ -28,7 +28,7 @@ import android.widget.Toast
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import com.example.teslamirror.ddns.DuckDnsUpdater
+import com.example.teslamirror.rendezvous.RendezvousUpdater
 import com.example.teslamirror.update.UpdateChecker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -59,10 +59,10 @@ fun HomeScreen() {
     var fps by remember { mutableStateOf(30) }
     var ipText by remember { mutableStateOf("확인 중…") }
 
-    // DuckDNS 토큰 — 저장된 값은 폰에만 있음 (SharedPreferences). 도메인은 코드에 고정.
-    var ddnsConfigured by remember { mutableStateOf(DuckDnsUpdater.isConfigured(context)) }
-    var ddnsTokenField by remember { mutableStateOf(DuckDnsUpdater.token(context)) }
-    var ddnsStatus by remember { mutableStateOf<String?>(null) }
+    // 접선 서버 시크릿 — 저장된 값은 폰에만 있음 (SharedPreferences). 서버 주소는 코드에 고정.
+    var regConfigured by remember { mutableStateOf(RendezvousUpdater.isConfigured(context)) }
+    var regSecretField by remember { mutableStateOf(RendezvousUpdater.secret(context)) }
+    var regStatus by remember { mutableStateOf<String?>(null) }
 
     val currentVersion = remember { UpdateChecker.currentVersion(context) }
     var updateInfo by remember { mutableStateOf<UpdateChecker.UpdateInfo?>(null) }
@@ -75,14 +75,14 @@ fun HomeScreen() {
     }
 
     // 접속 URL을 2초마다 실시간 갱신 — Wi-Fi/핫스팟을 켜고 끄면 화면이 바로 따라감.
-    // 핫스팟 IP가 바뀌면 DuckDNS A 레코드도 여기서 자동 갱신한다 (설정된 경우만).
+    // 핫스팟 IP가 바뀌면 접선 서버(Cloudflare Worker)에도 여기서 자동 등록한다.
     LaunchedEffect(Unit) {
         while (true) {
             val cands = withContext(Dispatchers.IO) { localIpCandidates() }
-            ipText = formatViewerUrls(cands, showDomain = ddnsConfigured)
+            ipText = formatViewerUrls(cands, showWorkerUrl = regConfigured)
             val hotspotIp = cands.firstOrNull { it.isHotspot }?.ip
             if (hotspotIp != null) {
-                DuckDnsUpdater.pushIfChanged(context, hotspotIp)?.let { ddnsStatus = it }
+                RendezvousUpdater.pushIfChanged(context, hotspotIp)?.let { regStatus = it }
             }
             delay(2000)
         }
@@ -172,7 +172,7 @@ fun HomeScreen() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             ScreenCaptureService.start(context, result.resultCode, result.data!!, fps)
-            ipText = formatViewerUrls(localIpCandidates(), showDomain = ddnsConfigured)
+            ipText = formatViewerUrls(localIpCandidates(), showWorkerUrl = regConfigured)
         }
     }
 
@@ -316,38 +316,44 @@ fun HomeScreen() {
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    "DuckDNS 자동 갱신",
+                    "공용 접속 주소 자동 등록",
                     fontSize = 22.sp,
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    "토큰을 저장하면 핫스팟 IP가 바뀔 때마다 ${DuckDnsUpdater.DOMAIN}.duckdns.org가 자동으로 따라옵니다.",
+                    "시크릿을 저장하면 이 폰의 핫스팟 IP를 접선 서버에 자동 등록합니다. " +
+                        "테슬라는 폰이 몇 대든 아래 주소 하나만 북마크하면 됩니다.",
                     fontSize = 15.sp,
                     lineHeight = 22.sp
                 )
+                Text(
+                    RendezvousUpdater.WORKER_URL,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 15.sp
+                )
                 OutlinedTextField(
-                    value = ddnsTokenField,
-                    onValueChange = { ddnsTokenField = it },
-                    label = { Text("토큰") },
+                    value = regSecretField,
+                    onValueChange = { regSecretField = it },
+                    label = { Text("시크릿") },
                     singleLine = true,
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth()
                 )
                 Button(
                     onClick = {
-                        DuckDnsUpdater.save(context, ddnsTokenField)
-                        ddnsConfigured = DuckDnsUpdater.isConfigured(context)
-                        ddnsStatus = null
+                        RendezvousUpdater.save(context, regSecretField)
+                        regConfigured = RendezvousUpdater.isConfigured(context)
+                        regStatus = null
                         Toast.makeText(
                             context,
-                            if (ddnsConfigured) "저장됨 — 핫스팟이 켜지면 자동 갱신됩니다"
-                            else "저장됨 — 토큰이 비어 있어 자동 갱신은 꺼집니다",
+                            if (regConfigured) "저장됨 — 핫스팟이 켜지면 자동 등록됩니다"
+                            else "저장됨 — 시크릿이 비어 있어 자동 등록은 꺼집니다",
                             Toast.LENGTH_SHORT
                         ).show()
                     },
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("저장", fontSize = 18.sp) }
-                ddnsStatus?.let {
+                regStatus?.let {
                     Text(it, fontSize = 14.sp, fontFamily = FontFamily.Monospace)
                 }
             }
@@ -380,18 +386,18 @@ fun HomeScreen() {
     }
 }
 
-private data class IpCandidate(val ip: String, val isHotspot: Boolean)
+internal data class IpCandidate(val ip: String, val isHotspot: Boolean)
 
-private fun formatViewerUrls(cands: List<IpCandidate>, showDomain: Boolean): String {
+private fun formatViewerUrls(cands: List<IpCandidate>, showWorkerUrl: Boolean): String {
     val port = if (HttpConfig.PORT == 80) "" else ":${HttpConfig.PORT}"
     val hotspot = cands.filter { it.isHotspot }
     // 핫스팟이 켜져 있으면 핫스팟 주소만, 없으면 일반 Wi-Fi 주소를 보여준다.
     val show = hotspot.ifEmpty { cands }
     if (show.isEmpty()) return "핫스팟을 켠 뒤 다시 시작하세요"
     val urls = show.map { "http://${it.ip}$port" }.toMutableList()
-    // 토큰이 저장돼 있고 핫스팟이 살아 있으면 도메인 주소를 맨 위에 — 테슬라 북마크용
-    if (showDomain && hotspot.isNotEmpty()) {
-        urls.add(0, "http://${DuckDnsUpdater.DOMAIN}.duckdns.org$port")
+    // 시크릿이 저장돼 있고 핫스팟이 살아 있으면 접선 서버 주소를 맨 위에 — 테슬라 북마크용
+    if (showWorkerUrl && hotspot.isNotEmpty()) {
+        urls.add(0, RendezvousUpdater.WORKER_URL)
     }
     return urls.joinToString("\n")
 }
@@ -400,7 +406,7 @@ private fun formatViewerUrls(cands: List<IpCandidate>, showDomain: Boolean): Str
  * 접속 가능한 로컬 IPv4 주소. 핫스팟(테슬라가 붙는 쪽)을 먼저.
  * 셀룰러(rmnet 등)는 테슬라가 닿을 수 없으므로 제외한다.
  */
-private fun localIpCandidates(): List<IpCandidate> {
+internal fun localIpCandidates(): List<IpCandidate> {
     return try {
         NetworkInterface.getNetworkInterfaces().toList()
             .filter { it.isUp && !it.isLoopback }

@@ -21,14 +21,18 @@ import android.view.WindowManager
 import java.net.NetworkInterface
 import androidx.core.app.NotificationCompat
 import com.example.teslamirror.capture.MjpegCapturer
+import com.example.teslamirror.rendezvous.RendezvousUpdater
 import com.example.teslamirror.server.MirrorServer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 class ScreenCaptureService : Service() {
 
@@ -44,6 +48,8 @@ class ScreenCaptureService : Service() {
 
         private const val AUTO_STOP_MS = 6 * 60 * 60 * 1000L  // 6시간
         private const val NET_CHECK_INTERVAL_MS = 5_000L      // 5초마다 핫스팟 점검
+        // 접선 서버 재등록 주기 — 주행 중 통신사 NAT의 공인 IP가 바뀌어도 따라가게
+        private const val REGISTER_INTERVAL_MS = 10 * 60_000L
         // 첫 시작 후 핫스팟이 잡힐 시간 여유
         private const val NET_CHECK_INITIAL_DELAY_MS = 10_000L
 
@@ -155,6 +161,7 @@ class ScreenCaptureService : Service() {
             consecutiveNetFailures = 0
             mainHandler.postDelayed(networkCheckRunnable, NET_CHECK_INITIAL_DELAY_MS)
             registerHotspotReceiver()
+            startPeriodicRendezvousRegistration()
         } catch (t: Throwable) {
             Log.e(TAG, "start failed", t)
             stopEverything()
@@ -188,6 +195,20 @@ class ScreenCaptureService : Service() {
             cap.surface, null, null
         )
         cap.start(scope)
+    }
+
+    // 미러링 도중에도 접선 서버에 주기적으로 재등록 — MainActivity의 2초 루프는
+    // 화면이 떠 있을 때만 돌기 때문에, 주행 중 갱신은 서비스가 책임진다.
+    private fun startPeriodicRendezvousRegistration() {
+        if (!RendezvousUpdater.isConfigured(this)) return
+        scope.launch {
+            while (isActive) {
+                localIpCandidates().firstOrNull { it.isHotspot }?.let {
+                    RendezvousUpdater.push(this@ScreenCaptureService, it.ip)
+                }
+                delay(REGISTER_INTERVAL_MS)
+            }
+        }
     }
 
     private fun displayParams(): Triple<Int, Int, Int> {
