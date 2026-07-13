@@ -23,10 +23,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import android.widget.Toast
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.example.teslamirror.ddns.DuckDnsUpdater
 import com.example.teslamirror.update.UpdateChecker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -55,7 +57,13 @@ fun HomeScreen() {
     val scope = rememberCoroutineScope()
     val running by ScreenCaptureService.isRunningFlow.collectAsState()
     var fps by remember { mutableStateOf(30) }
-    var ipText by remember { mutableStateOf(currentLocalAddresses()) }
+    var ipText by remember { mutableStateOf("확인 중…") }
+
+    // DuckDNS 설정 — 저장된 값은 폰에만 있음 (SharedPreferences)
+    var ddnsDomain by remember { mutableStateOf(DuckDnsUpdater.domain(context)) }
+    var ddnsDomainField by remember { mutableStateOf(DuckDnsUpdater.domain(context)) }
+    var ddnsTokenField by remember { mutableStateOf(DuckDnsUpdater.token(context)) }
+    var ddnsStatus by remember { mutableStateOf<String?>(null) }
 
     val currentVersion = remember { UpdateChecker.currentVersion(context) }
     var updateInfo by remember { mutableStateOf<UpdateChecker.UpdateInfo?>(null) }
@@ -67,10 +75,16 @@ fun HomeScreen() {
         runCatching { UpdateChecker.checkForUpdate(context) }.getOrNull()?.let { updateInfo = it }
     }
 
-    // 접속 URL을 2초마다 실시간 갱신 — Wi-Fi/핫스팟을 켜고 끄면 화면이 바로 따라감
+    // 접속 URL을 2초마다 실시간 갱신 — Wi-Fi/핫스팟을 켜고 끄면 화면이 바로 따라감.
+    // 핫스팟 IP가 바뀌면 DuckDNS A 레코드도 여기서 자동 갱신한다 (설정된 경우만).
     LaunchedEffect(Unit) {
         while (true) {
-            ipText = withContext(Dispatchers.IO) { currentLocalAddresses() }
+            val cands = withContext(Dispatchers.IO) { localIpCandidates() }
+            ipText = formatViewerUrls(cands, ddnsDomain)
+            val hotspotIp = cands.firstOrNull { it.isHotspot }?.ip
+            if (hotspotIp != null) {
+                DuckDnsUpdater.pushIfChanged(context, hotspotIp)?.let { ddnsStatus = it }
+            }
             delay(2000)
         }
     }
@@ -159,7 +173,7 @@ fun HomeScreen() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             ScreenCaptureService.start(context, result.resultCode, result.data!!, fps)
-            ipText = currentLocalAddresses()
+            ipText = formatViewerUrls(localIpCandidates(), ddnsDomain)
         }
     }
 
@@ -297,6 +311,57 @@ fun HomeScreen() {
             }
         }
 
+        Card {
+            Column(
+                Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    "DuckDNS 자동 갱신 (선택)",
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "설정하면 핫스팟 IP가 바뀌어도 테슬라에서는 항상 같은 도메인으로 접속할 수 있습니다.",
+                    fontSize = 15.sp,
+                    lineHeight = 22.sp
+                )
+                OutlinedTextField(
+                    value = ddnsDomainField,
+                    onValueChange = { ddnsDomainField = it },
+                    label = { Text("도메인 (예: teslamirror)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = ddnsTokenField,
+                    onValueChange = { ddnsTokenField = it },
+                    label = { Text("토큰") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Button(
+                    onClick = {
+                        DuckDnsUpdater.save(context, ddnsDomainField, ddnsTokenField)
+                        ddnsDomain = DuckDnsUpdater.domain(context)
+                        ddnsDomainField = ddnsDomain
+                        ddnsStatus = null
+                        Toast.makeText(
+                            context,
+                            if (DuckDnsUpdater.isConfigured(context)) "저장됨 — 핫스팟이 켜지면 자동 갱신됩니다"
+                            else "저장됨 — 도메인/토큰이 비어 있어 자동 갱신은 꺼집니다",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("저장", fontSize = 18.sp) }
+                ddnsStatus?.let {
+                    Text(it, fontSize = 14.sp, fontFamily = FontFamily.Monospace)
+                }
+            }
+        }
+
         Text(
             "팁: 테슬라 차량의 Wi-Fi 설정에서 폰 핫스팟 SSID를 길게 눌러 \"Remain connected in Drive\"를 켜야 주행 중에도 끊기지 않습니다.",
             fontSize = 15.sp,
@@ -326,14 +391,18 @@ fun HomeScreen() {
 
 private data class IpCandidate(val ip: String, val isHotspot: Boolean)
 
-private fun currentLocalAddresses(): String {
-    val cands = localIpCandidates()
+private fun formatViewerUrls(cands: List<IpCandidate>, ddnsDomain: String): String {
     val port = if (HttpConfig.PORT == 80) "" else ":${HttpConfig.PORT}"
     val hotspot = cands.filter { it.isHotspot }
     // 핫스팟이 켜져 있으면 핫스팟 주소만, 없으면 일반 Wi-Fi 주소를 보여준다.
     val show = hotspot.ifEmpty { cands }
     if (show.isEmpty()) return "핫스팟을 켠 뒤 다시 시작하세요"
-    return show.joinToString("\n") { "http://${it.ip}$port" }
+    val urls = show.map { "http://${it.ip}$port" }.toMutableList()
+    // DuckDNS가 설정돼 있고 핫스팟이 살아 있으면 도메인 주소를 맨 위에 — 테슬라 북마크용
+    if (ddnsDomain.isNotBlank() && hotspot.isNotEmpty()) {
+        urls.add(0, "http://$ddnsDomain.duckdns.org$port")
+    }
+    return urls.joinToString("\n")
 }
 
 /**
