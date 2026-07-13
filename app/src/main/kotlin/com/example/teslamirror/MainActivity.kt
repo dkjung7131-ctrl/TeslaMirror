@@ -28,6 +28,9 @@ import android.widget.Toast
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.example.teslamirror.adb.AdbManager
+import com.example.teslamirror.apps.AppEntry
+import com.example.teslamirror.apps.installedLaunchableApps
 import com.example.teslamirror.rendezvous.RendezvousUpdater
 import com.example.teslamirror.update.UpdateChecker
 import kotlinx.coroutines.Dispatchers
@@ -58,6 +61,56 @@ fun HomeScreen() {
     val running by ScreenCaptureService.isRunningFlow.collectAsState()
     var fps by remember { mutableStateOf(30) }
     var ipText by remember { mutableStateOf("확인 중…") }
+
+    // 모드: false=전체화면 미러링(MediaProjection), true=앱 전용(헤드리스, scrcpy)
+    var appMode by remember { mutableStateOf(false) }
+    val appRunning by AppCastService.isRunningFlow.collectAsState()
+    val appStatus by AppCastService.statusFlow.collectAsState()
+
+    // 앱 모드용 상태
+    val appPrefs = remember { context.getSharedPreferences("appcast", Context.MODE_PRIVATE) }
+    var appList by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
+    var selectedPkg by remember { mutableStateOf(appPrefs.getString("pkg", null)) }
+    var appMenuOpen by remember { mutableStateOf(false) }
+    var adbConnected by remember { mutableStateOf(false) }
+    var pairing by remember { mutableStateOf(false) }
+    var pairPort by remember { mutableStateOf("") }
+    var pairCode by remember { mutableStateOf("") }
+
+    // 앱 모드 진입 시 설치 앱 목록 로드
+    LaunchedEffect(appMode) {
+        if (appMode && appList.isEmpty()) {
+            appList = withContext(Dispatchers.IO) { installedLaunchableApps(context) }
+        }
+    }
+
+    fun pairAdb() {
+        val port = pairPort.trim().toIntOrNull()
+        if (port == null || pairCode.trim().length < 6) {
+            Toast.makeText(context, "포트와 6자리 코드를 확인하세요", Toast.LENGTH_SHORT).show(); return
+        }
+        pairing = true
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val mgr = AdbManager.getInstance(context)
+                    mgr.pair("127.0.0.1", port, pairCode.trim())
+                    mgr.autoConnect(context, 20_000)
+                }
+            }
+            pairing = false
+            result.onSuccess { ok ->
+                adbConnected = ok
+                Toast.makeText(
+                    context,
+                    if (ok) "페어링 + 연결 완료" else "페어링됐지만 연결 실패 — 무선 디버깅이 켜져 있는지 확인",
+                    Toast.LENGTH_LONG
+                ).show()
+            }.onFailure {
+                Toast.makeText(context, "페어링 실패: ${it.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
 
     // 접선 서버 시크릿 — 저장된 값은 폰에만 있음 (SharedPreferences). 서버 주소는 코드에 고정.
     var regConfigured by remember { mutableStateOf(RendezvousUpdater.isConfigured(context)) }
@@ -208,6 +261,130 @@ fun HomeScreen() {
             lineHeight = 28.sp
         )
 
+        // ── 모드 선택 ──
+        val anyRunning = running || appRunning
+        Card {
+            Column(
+                Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("모드", fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    RadioButton(selected = !appMode, onClick = { appMode = false }, enabled = !anyRunning)
+                    Text("전체화면 미러링 (폰 화면 그대로)", fontSize = 18.sp)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    RadioButton(selected = appMode, onClick = { appMode = true }, enabled = !anyRunning)
+                    Text("앱 모드 (선택한 앱만, 테슬라 해상도)", fontSize = 18.sp)
+                }
+            }
+        }
+
+        // ── 앱 모드 UI ──
+        if (appMode) {
+            if (!adbConnected) {
+                Card {
+                    Column(
+                        Modifier.padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text("무선 디버깅 페어링", fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "설정 → 개발자 옵션 → 무선 디버깅 → \"페어링 코드로 기기 페어링\"에 뜨는 " +
+                                "포트와 6자리 코드를 입력하세요. (최초 1회, 재설치 전까지 유지)",
+                            fontSize = 15.sp, lineHeight = 22.sp
+                        )
+                        OutlinedTextField(
+                            value = pairPort, onValueChange = { pairPort = it },
+                            label = { Text("페어링 포트") }, singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        OutlinedTextField(
+                            value = pairCode, onValueChange = { pairCode = it },
+                            label = { Text("페어링 코드 (6자리)") }, singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Button(
+                            onClick = { pairAdb() },
+                            enabled = !pairing,
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text(if (pairing) "페어링 중…" else "페어링", fontSize = 18.sp) }
+                    }
+                }
+            }
+
+            Card {
+                Column(
+                    Modifier.padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("캐스트할 앱", fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                    val selectedLabel = appList.firstOrNull { it.packageName == selectedPkg }?.label
+                        ?: selectedPkg ?: "앱을 선택하세요"
+                    Box {
+                        OutlinedButton(
+                            onClick = { appMenuOpen = true },
+                            enabled = !appRunning,
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text(selectedLabel, fontSize = 18.sp) }
+                        DropdownMenu(
+                            expanded = appMenuOpen,
+                            onDismissRequest = { appMenuOpen = false },
+                            modifier = Modifier.heightIn(max = 360.dp)
+                        ) {
+                            appList.forEach { app ->
+                                DropdownMenuItem(
+                                    text = { Text(app.label) },
+                                    onClick = {
+                                        selectedPkg = app.packageName
+                                        appPrefs.edit().putString("pkg", app.packageName).apply()
+                                        appMenuOpen = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!appRunning) {
+                Button(
+                    onClick = {
+                        when {
+                            selectedPkg == null ->
+                                Toast.makeText(context, "앱을 선택하세요", Toast.LENGTH_SHORT).show()
+                            !isHotspotEnabled(context) ->
+                                Toast.makeText(context, "핫스팟을 먼저 켜주세요", Toast.LENGTH_LONG).show()
+                            else -> {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                    ContextCompat.checkSelfPermission(
+                                        context, Manifest.permission.POST_NOTIFICATIONS
+                                    ) != PackageManager.PERMISSION_GRANTED
+                                ) {
+                                    notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                }
+                                AppCastService.start(context, selectedPkg!!)
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(vertical = 18.dp)
+                ) { Text("앱 캐스트 시작", fontSize = 22.sp, fontWeight = FontWeight.SemiBold) }
+            } else {
+                Button(
+                    onClick = { AppCastService.stop(context) },
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(vertical = 18.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) { Text("중지", fontSize = 22.sp, fontWeight = FontWeight.SemiBold) }
+            }
+            if (appStatus.isNotBlank()) {
+                Text(appStatus, fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+
+        // ── 전체화면 미러링 UI ──
+        if (!appMode) {
         Card {
             Column(
                 Modifier.padding(20.dp),
@@ -236,6 +413,7 @@ fun HomeScreen() {
                 }
             }
         }
+        }
 
         Card {
             Column(
@@ -256,6 +434,7 @@ fun HomeScreen() {
             }
         }
 
+        if (!appMode) {
         if (!running) {
             Button(
                 onClick = {
@@ -308,6 +487,7 @@ fun HomeScreen() {
                     fontWeight = FontWeight.SemiBold
                 )
             }
+        }
         }
 
         Card {

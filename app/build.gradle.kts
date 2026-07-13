@@ -56,6 +56,10 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             if (hasReleaseKey) signingConfig = signingConfigs.getByName("release")
         }
+        debug {
+            // 릴리스 설치본과 나란히 설치 가능하게 (개발 중 실험용)
+            applicationIdSuffix = ".debug"
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -93,6 +97,12 @@ dependencies {
     val ktorVersion = "2.3.13"
     implementation("io.ktor:ktor-server-core:$ktorVersion")
     implementation("io.ktor:ktor-server-netty:$ktorVersion")
+    implementation("io.ktor:ktor-server-websockets:$ktorVersion")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // 앱 전용 미러링 모드: 내장 ADB(무선 페어링) + X509 인증서 생성
+    implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
+    implementation("com.github.MuntashirAkon:sun-security-android:1.1")
+    implementation("org.conscrypt:conscrypt-android:2.5.3")
 }
