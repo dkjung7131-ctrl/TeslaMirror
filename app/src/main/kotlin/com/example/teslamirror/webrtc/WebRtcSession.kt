@@ -15,6 +15,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
@@ -70,6 +71,7 @@ class WebRtcSession(
 
     fun start() {
         running = true
+        Log.i(TAG, "start deviceId=$deviceId secretSet=${secret.isNotBlank()} ${width}x$height@$fps")
         initFactory()
         startCapture()
         scope.launch { negotiateLoop() }
@@ -121,7 +123,8 @@ class WebRtcSession(
                 onStatus("연결 대기 — 테슬라에서 접속하세요")
                 createPeerConnection()
                 val offerSdp = createOfferAndGather()
-                postOffer(offerId, offerSdp)
+                val code = postOffer(offerId, offerSdp)
+                Log.i(TAG, "offer posted id=$offerId http=$code")
                 val answer = pollAnswer(offerId, timeoutMs = 25_000)
                 if (answer == null) {
                     Log.i(TAG, "no answer, re-offering")
@@ -196,11 +199,18 @@ class WebRtcSession(
                 override fun onCreateFailure(e: String?) {}
             }, offer)
         }
-        // non-trickle: ICE 수집 완료까지 대기 후 후보 포함된 localDescription 사용
-        if (pc!!.iceGatheringState() != PeerConnection.IceGatheringState.COMPLETE) {
-            suspendCancellableCoroutine<Unit> { cont -> gatherSignal = cont }
+        // non-trickle: ICE 수집을 최대 5초 대기(로컬 핫스팟은 host 후보만으로 충분).
+        // 완료 신호를 놓치는 경합이 있어도 타임아웃으로 진행한다.
+        withTimeoutOrNull(5000) {
+            if (pc!!.iceGatheringState() != PeerConnection.IceGatheringState.COMPLETE) {
+                suspendCancellableCoroutine<Unit> { cont -> gatherSignal = cont }
+            }
         }
-        return pc!!.localDescription?.description ?: offer.description
+        gatherSignal = null
+        val sdp = pc!!.localDescription?.description ?: offer.description
+        val nCand = Regex("a=candidate").findAll(sdp).count()
+        Log.i(TAG, "offer ready, gathering=${pc!!.iceGatheringState()} candidates=$nCand")
+        return sdp
     }
 
     private suspend fun setRemote(answerSdp: String) {
@@ -226,7 +236,7 @@ class WebRtcSession(
     }
 
     // ---- 시그널링 HTTP ----
-    private suspend fun postOffer(offerId: String, sdp: String) = withContext(Dispatchers.IO) {
+    private suspend fun postOffer(offerId: String, sdp: String): Int = withContext(Dispatchers.IO) {
         val body = JSONObject().put("deviceId", deviceId).put("offerId", offerId).put("sdp", sdp).toString()
         val conn = (URL("$base/offer").openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"; doOutput = true; connectTimeout = 10_000; readTimeout = 10_000
@@ -234,8 +244,9 @@ class WebRtcSession(
             setRequestProperty("Authorization", "Bearer $secret")
         }
         conn.outputStream.use { it.write(body.toByteArray()) }
-        conn.responseCode
+        val code = conn.responseCode
         conn.disconnect()
+        code
     }
 
     private suspend fun pollAnswer(offerId: String, timeoutMs: Long): String? = withContext(Dispatchers.IO) {
