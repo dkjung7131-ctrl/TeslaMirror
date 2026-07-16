@@ -165,44 +165,55 @@ ${items ? '<p>접속할 폰을 선택하세요</p>' : ''}
 </body></html>`;
 }
 
-// WebRTC 뷰어 — 공개 HTTPS 페이지. 폰의 오퍼를 받아 앤서를 올리고 로컬 P2P로 영상 재생.
+// WebRTC 뷰어 — 공개 HTTPS 페이지. 폰의 오퍼를 받아 앤서를 올리고, JPEG 프레임을
+// 데이터 채널로 받아 캔버스에 즉시 그린다(버퍼 없음 → 내비 실시간성).
 function viewerHtml(deviceId) {
   return `<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>TeslaMirror</title><style>
   html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:sans-serif;color:#fff}
-  #v{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+  #c{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
   #s{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);font-size:20px;opacity:.85;text-align:center;line-height:1.6}
   #st{position:fixed;left:8px;bottom:8px;font-size:12px;font-family:monospace;color:#7f7;background:rgba(0,0,0,.5);padding:4px 8px;border-radius:6px;z-index:9}
 </style></head><body>
-<video id="v" playsinline autoplay muted></video>
+<canvas id="c"></canvas>
 <div id="s">연결 중…</div>
 <div id="st"></div>
 <script>
 (function(){
   var DEVICE_ID=${JSON.stringify(String(deviceId))};
-  var v=document.getElementById('v'), s=document.getElementById('s');
+  var s=document.getElementById('s'), stEl=document.getElementById('st');
+  var canvas=document.getElementById('c'), ctx=canvas.getContext('2d');
   function st(t){ s.style.display=t?'':'none'; s.textContent=t||''; }
   function iceDone(pc){ return new Promise(function(res){
     if(pc.iceGatheringState==='complete') return res();
     var t=setTimeout(res,3000);
     pc.addEventListener('icegatheringstatechange',function(){ if(pc.iceGatheringState==='complete'){clearTimeout(t);res();} });
   }); }
-  var pc=null, tries=0;
+  var pc=null, tries=0, drawing=false, fpsCount=0, lastFpsT=Date.now(), fps=0;
+  function drawJpeg(buf){
+    if(drawing) return;              // 디코드 중이면 새 프레임은 버림(백로그 방지 → 최신 우선)
+    drawing=true;
+    var blob=new Blob([buf],{type:'image/jpeg'});
+    createImageBitmap(blob).then(function(bmp){
+      if(canvas.width!==bmp.width){ canvas.width=bmp.width; canvas.height=bmp.height; }
+      ctx.drawImage(bmp,0,0); bmp.close(); drawing=false;
+      st(''); fpsCount++;
+      var now=Date.now(); if(now-lastFpsT>=1000){ fps=fpsCount; fpsCount=0; lastFpsT=now; }
+    }).catch(function(){ drawing=false; });
+  }
   async function connect(){
     try{
       var r=await fetch('/offer?id='+encodeURIComponent(DEVICE_ID),{cache:'no-store'});
       if(!r.ok){ st('폰 대기 중… (앱에서 미러링을 시작하세요)'); return schedule(); }
       var offer=await r.json();
       if(pc){ try{pc.close();}catch(e){} }
-      // STUN 없음: 로컬(핫스팟) host 후보만 사용 — 셀룰러 경유 경로를 원천 차단해 저지연 보장
-      pc=new RTCPeerConnection({iceServers:[]});
+      pc=new RTCPeerConnection({iceServers:[]});   // STUN 없음: 로컬 host만
       window.pc=pc;
-      pc.ontrack=function(e){
-        v.srcObject=e.streams[0]; v.play().catch(function(){}); st('');
-        try{ e.receiver.jitterBufferTarget=0; }catch(_){}
-        try{ e.receiver.playoutDelayHint=0; }catch(_){}
+      pc.ondatachannel=function(e){
+        var dc=e.channel; dc.binaryType='arraybuffer';
+        dc.onmessage=function(ev){ drawJpeg(ev.data); };
       };
       pc.onconnectionstatechange=function(){
         if(pc.connectionState==='connected') st('');
@@ -216,10 +227,9 @@ function viewerHtml(deviceId) {
         body:JSON.stringify({deviceId:DEVICE_ID,offerId:offer.offerId,sdp:pc.localDescription.sdp})});
     }catch(e){ st('오류: '+e.message); schedule(); }
   }
-  function schedule(){ tries++; setTimeout(connect, Math.min(1000+tries*500,4000)); }
+  function schedule(){ tries++; setTimeout(connect, Math.min(700+tries*400,3000)); }
   connect();
-  // 경로/지연 실시간 표시 — host↔host(로컬)인지, RTT 몇 ms인지 눈으로 확인
-  var stEl=document.getElementById('st');
+  // 경로/지연/fps 표시
   setInterval(async function(){
     if(!pc || pc.connectionState!=='connected'){ stEl.textContent=''; return; }
     try{
@@ -227,11 +237,9 @@ function viewerHtml(deviceId) {
       stats.forEach(function(x){ if(x.type==='local-candidate'||x.type==='remote-candidate') cands[x.id]=x; });
       stats.forEach(function(x){ if(x.type==='candidate-pair' && x.nominated && x.state==='succeeded') pair=x; });
       if(!pair){ stats.forEach(function(x){ if(x.type==='transport' && x.selectedCandidatePairId) pair=stats.get(x.selectedCandidatePairId); }); }
-      if(pair){
-        var l=cands[pair.localCandidateId]||{}, rm=cands[pair.remoteCandidateId]||{};
-        var rtt=(pair.currentRoundTripTime!=null)?Math.round(pair.currentRoundTripTime*1000)+'ms':'?';
-        stEl.textContent=(l.candidateType||'?')+'↔'+(rm.candidateType||'?')+' rtt '+rtt;
-      }
+      var rtt='?'; if(pair && pair.currentRoundTripTime!=null) rtt=Math.round(pair.currentRoundTripTime*1000)+'ms';
+      var lt=pair?(cands[pair.localCandidateId]||{}).candidateType:'?';
+      stEl.textContent=lt+' rtt '+rtt+' · '+fps+'fps';
     }catch(e){}
   }, 1000);
 })();

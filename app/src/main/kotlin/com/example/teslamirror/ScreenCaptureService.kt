@@ -178,6 +178,7 @@ class ScreenCaptureService : Service() {
         val (capW, capH) = scaleTo720p(w, h)
         webRtcSession = com.example.teslamirror.webrtc.WebRtcSession(
             context = this,
+            resultCode = resultCode,
             projectionData = data,
             width = capW,
             height = capH,
