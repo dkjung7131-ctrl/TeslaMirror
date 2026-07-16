@@ -71,7 +71,7 @@ export default {
       if (pick) {
         return Response.redirect(`http://${pick.hotspotIp}:${MIRROR_PORT}/`, 302);
       }
-      return new Response(chooserHtml(matches.length ? matches : entries), {
+      return new Response(chooserHtml(entries, myIp), {
         headers: { 'content-type': 'text/html; charset=utf-8' },
       });
     }
@@ -125,14 +125,21 @@ function ageText(ts) {
   return Math.floor(h / 24) + '일 전 등록';
 }
 
-// 자동 매칭이 안 될 때: 폰 목록을 큰 버튼으로 — 테슬라 터치스크린 기준
-function chooserHtml(entries) {
+// 자동 매칭이 안 될 때: 폰 목록을 큰 버튼으로 — 테슬라 터치스크린 기준.
+// 각 항목에 "이 브라우저와 같은 네트워크(공인 IP 일치)인지"를 표시해
+// 차가 엉뚱한 Wi-Fi에 붙은 경우를 현장에서 바로 알 수 있게 한다.
+function chooserHtml(entries, myIp) {
   const items = entries
-    .map(
-      (e) =>
+    .map((e) => {
+      const same = samePeer(e.publicIp, myIp);
+      const badge = same
+        ? '<b style="color:#4ade80">✓ 이 화면과 같은 네트워크</b>'
+        : '<b style="color:#fbbf24">⚠ 다른 네트워크 — 이 폰 핫스팟에 연결돼 있지 않음</b>';
+      return (
         `<a class="btn" href="http://${e.hotspotIp}:${MIRROR_PORT}/">` +
-        `${escapeHtml(e.name)}<span>${e.hotspotIp} · ${ageText(e.ts)}</span></a>`
-    )
+        `${escapeHtml(e.name)}<span>${e.hotspotIp} · ${ageText(e.ts)}</span>${badge}</a>`
+      );
+    })
     .join('\n');
   return `<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
@@ -143,6 +150,7 @@ function chooserHtml(entries) {
   h1{font-size:28px;margin:0 0 8px}
   .btn{display:flex;flex-direction:column;gap:4px;width:100%;max-width:480px;background:#2563eb;color:#fff;text-decoration:none;padding:22px 24px;border-radius:14px;font-size:24px;font-weight:600;text-align:center}
   .btn span{font-size:15px;font-weight:400;opacity:.8}
+  .btn b{font-size:14px;font-weight:600}
   p{opacity:.7;font-size:17px}
 </style></head><body>
 <h1>TeslaMirror</h1>
