@@ -95,7 +95,12 @@ class WebRtcSession(
                 .createInitializationOptions()
         )
         eglBase = EglBase.create()
+        // 폰이 핫스팟 AP라 Android NetworkMonitor(ConnectivityManager)가 swlan0의 IPv4를
+        // 열거하지 못한다 → 로컬 후보가 안 생기고 셀룰러 경로만 남아 지연 폭증.
+        // disableNetworkMonitor로 네이티브 getifaddrs 열거를 쓰면 swlan0 IPv4도 잡힌다.
+        val options = PeerConnectionFactory.Options().apply { disableNetworkMonitor = true }
         factory = PeerConnectionFactory.builder()
+            .setOptions(options)
             .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
             .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
             .createPeerConnectionFactory()
@@ -119,35 +124,60 @@ class WebRtcSession(
     private suspend fun negotiateLoop() {
         while (running) {
             try {
-                val offerId = System.currentTimeMillis().toString()
                 onStatus("연결 대기 — 테슬라에서 접속하세요")
                 createPeerConnection()
+                val offerId = System.currentTimeMillis().toString()
                 val offerSdp = createOfferAndGather()
-                val code = postOffer(offerId, offerSdp)
-                Log.i(TAG, "offer posted id=$offerId http=$code")
-                val answer = pollAnswer(offerId, timeoutMs = 25_000)
-                if (answer == null) {
-                    Log.i(TAG, "no answer, re-offering")
-                    closePc()
-                    continue
-                }
+                postOffer(offerId, offerSdp)
+                Log.i(TAG, "offer posted id=$offerId")
+                // 오퍼ID를 안정적으로 유지하며 앤서를 기다린다. 오퍼를 자주 바꾸면
+                // KV 지연/경합으로 뷰어 앤서와 offerId가 어긋나므로, 재오퍼는 연결
+                // 실패 시에만 한다.
+                val answer = awaitAnswer(offerId)
+                if (answer == null) { closePc(); continue }
                 setRemote(answer)
+                Log.i(TAG, "answer applied, awaiting connection")
+                if (!awaitConnected(12_000)) {
+                    Log.i(TAG, "not connected in 12s, re-offering")
+                    closePc(); continue
+                }
                 onStatus("연결됨")
-                // 연결이 유지되는 동안 대기; 끊기면 재협상
-                awaitPcClosed()
+                awaitPcClosed()  // 끊길 때까지 유지
             } catch (t: Throwable) {
                 if (running) Log.w(TAG, "negotiate error", t)
             } finally {
                 closePc()
             }
-            if (running) delay(1000)
+            if (running) delay(500)
         }
     }
 
+    /** running 동안 앤서를 폴링. 45초마다 같은 오퍼를 재게시해 KV TTL을 갱신. */
+    private suspend fun awaitAnswer(offerId: String): String? {
+        var lastRepost = System.currentTimeMillis()
+        while (running) {
+            fetchAnswer(offerId)?.let { return it }
+            if (System.currentTimeMillis() - lastRepost > 45_000) {
+                val sdp = pc?.localDescription?.description ?: return null
+                postOffer(offerId, sdp)
+                lastRepost = System.currentTimeMillis()
+            }
+            delay(1500)
+        }
+        return null
+    }
+
+    private suspend fun awaitConnected(timeoutMs: Long): Boolean {
+        if (pc?.connectionState() == PeerConnection.PeerConnectionState.CONNECTED) return true
+        return withTimeoutOrNull(timeoutMs) {
+            suspendCancellableCoroutine<Unit> { cont -> connectedSignal = cont }
+        } != null
+    }
+
     private fun createPeerConnection() {
-        val cfg = PeerConnection.RTCConfiguration(
-            listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
-        ).apply {
+        // STUN 없음: 뷰어(테슬라)는 항상 같은 핫스팟에 있으므로 host 후보만으로 연결.
+        // srflx(셀룰러 NAT 경유) 후보가 끼면 인터넷 왕복 경로가 선택돼 지연이 폭증한다.
+        val cfg = PeerConnection.RTCConfiguration(emptyList()).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
         }
         pc = factory.createPeerConnection(cfg, object : PeerConnection.Observer {
@@ -159,7 +189,10 @@ class WebRtcSession(
             }
             override fun onConnectionChange(s: PeerConnection.PeerConnectionState?) {
                 Log.i(TAG, "pc=$s")
-                if (s == PeerConnection.PeerConnectionState.CONNECTED) onStatus("연결됨 — 재생 중")
+                if (s == PeerConnection.PeerConnectionState.CONNECTED) {
+                    onStatus("연결됨 — 재생 중")
+                    connectedSignal?.let { runCatching { it.resume(Unit) }; connectedSignal = null }
+                }
                 if (s == PeerConnection.PeerConnectionState.FAILED ||
                     s == PeerConnection.PeerConnectionState.DISCONNECTED ||
                     s == PeerConnection.PeerConnectionState.CLOSED
@@ -181,6 +214,7 @@ class WebRtcSession(
 
     private var gatherSignal: kotlin.coroutines.Continuation<Unit>? = null
     private var pcClosedSignal: kotlin.coroutines.Continuation<Unit>? = null
+    private var connectedSignal: kotlin.coroutines.Continuation<Unit>? = null
 
     private suspend fun createOfferAndGather(): String {
         val offer = suspendCancellableCoroutine<SessionDescription> { cont ->
@@ -207,10 +241,30 @@ class WebRtcSession(
             }
         }
         gatherSignal = null
-        val sdp = pc!!.localDescription?.description ?: offer.description
-        val nCand = Regex("a=candidate").findAll(sdp).count()
-        Log.i(TAG, "offer ready, gathering=${pc!!.iceGatheringState()} candidates=$nCand")
+        val rawSdp = pc!!.localDescription?.description ?: offer.description
+        Regex("""a=candidate:[^\r\n]*""").findAll(rawSdp).forEach { Log.i(TAG, "  raw: ${it.value.take(72)}") }
+        // 핫스팟 로컬 후보(사설 IPv4)만 남긴다 — 셀룰러/공인 IPv6 후보가 끼면 통신사 망 왕복.
+        val sdp = filterToLocalCandidates(rawSdp)
+        val kept = Regex("""a=candidate:[^\r\n]*""").findAll(sdp).map { it.value }.toList()
+        Log.i(TAG, "offer ready localCandidates=${kept.size}")
+        kept.forEach { Log.i(TAG, "  keep: ${it.take(72)}") }
         return sdp
+    }
+
+    /** SDP에서 사설 IPv4(10/8, 172.16/12, 192.168/16) host 후보만 남기고 나머지 후보 줄 제거. */
+    private fun filterToLocalCandidates(sdp: String): String {
+        val out = sdp.split("\r\n", "\n").map { it.trimEnd('\r') }.filter { line ->
+            if (!line.startsWith("a=candidate:")) return@filter true
+            val addr = line.removePrefix("a=").split(' ').getOrNull(4) ?: return@filter false
+            isPrivateIpv4(addr)
+        }
+        return out.joinToString("\r\n").trimEnd() + "\r\n"
+    }
+
+    private fun isPrivateIpv4(a: String): Boolean {
+        val m = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""").find(a) ?: return false
+        val p = m.groupValues.drop(1).map { it.toIntOrNull() ?: return false }
+        return p[0] == 10 || (p[0] == 192 && p[1] == 168) || (p[0] == 172 && p[1] in 16..31)
     }
 
     private suspend fun setRemote(answerSdp: String) {
@@ -231,6 +285,7 @@ class WebRtcSession(
     private fun closePc() {
         gatherSignal = null
         pcClosedSignal = null
+        connectedSignal = null
         runCatching { pc?.close() }
         pc = null
     }
@@ -249,24 +304,21 @@ class WebRtcSession(
         code
     }
 
-    private suspend fun pollAnswer(offerId: String, timeoutMs: Long): String? = withContext(Dispatchers.IO) {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (running && System.currentTimeMillis() < deadline) {
-            try {
-                val conn = (URL("$base/answer?id=$deviceId").openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 8_000; readTimeout = 8_000
-                }
-                if (conn.responseCode == 200) {
-                    val txt = conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
-                    conn.disconnect()
-                    val o = JSONObject(txt)
-                    if (o.optString("offerId") == offerId) return@withContext o.getString("sdp")
-                } else {
-                    conn.disconnect()
-                }
-            } catch (_: Throwable) {}
-            delay(1500)
-        }
+    /** 앤서를 한 번 조회. offerId가 일치하면 sdp, 아니면 null. */
+    private suspend fun fetchAnswer(offerId: String): String? = withContext(Dispatchers.IO) {
+        try {
+            val conn = (URL("$base/answer?id=$deviceId").openConnection() as HttpURLConnection).apply {
+                connectTimeout = 8_000; readTimeout = 8_000
+            }
+            if (conn.responseCode == 200) {
+                val txt = conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
+                conn.disconnect()
+                val o = JSONObject(txt)
+                if (o.optString("offerId") == offerId) return@withContext o.getString("sdp")
+            } else {
+                conn.disconnect()
+            }
+        } catch (_: Throwable) {}
         null
     }
 

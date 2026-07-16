@@ -174,9 +174,11 @@ function viewerHtml(deviceId) {
   html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:sans-serif;color:#fff}
   #v{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
   #s{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);font-size:20px;opacity:.85;text-align:center;line-height:1.6}
+  #st{position:fixed;left:8px;bottom:8px;font-size:12px;font-family:monospace;color:#7f7;background:rgba(0,0,0,.5);padding:4px 8px;border-radius:6px;z-index:9}
 </style></head><body>
 <video id="v" playsinline autoplay muted></video>
 <div id="s">연결 중…</div>
+<div id="st"></div>
 <script>
 (function(){
   var DEVICE_ID=${JSON.stringify(String(deviceId))};
@@ -194,8 +196,14 @@ function viewerHtml(deviceId) {
       if(!r.ok){ st('폰 대기 중… (앱에서 미러링을 시작하세요)'); return schedule(); }
       var offer=await r.json();
       if(pc){ try{pc.close();}catch(e){} }
-      pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-      pc.ontrack=function(e){ v.srcObject=e.streams[0]; v.play().catch(function(){}); st(''); };
+      // STUN 없음: 로컬(핫스팟) host 후보만 사용 — 셀룰러 경유 경로를 원천 차단해 저지연 보장
+      pc=new RTCPeerConnection({iceServers:[]});
+      window.pc=pc;
+      pc.ontrack=function(e){
+        v.srcObject=e.streams[0]; v.play().catch(function(){}); st('');
+        try{ e.receiver.jitterBufferTarget=0; }catch(_){}
+        try{ e.receiver.playoutDelayHint=0; }catch(_){}
+      };
       pc.onconnectionstatechange=function(){
         if(pc.connectionState==='connected') st('');
         if(pc.connectionState==='failed'||pc.connectionState==='disconnected'||pc.connectionState==='closed'){ st('재연결 중…'); schedule(); }
@@ -210,6 +218,22 @@ function viewerHtml(deviceId) {
   }
   function schedule(){ tries++; setTimeout(connect, Math.min(1000+tries*500,4000)); }
   connect();
+  // 경로/지연 실시간 표시 — host↔host(로컬)인지, RTT 몇 ms인지 눈으로 확인
+  var stEl=document.getElementById('st');
+  setInterval(async function(){
+    if(!pc || pc.connectionState!=='connected'){ stEl.textContent=''; return; }
+    try{
+      var stats=await pc.getStats(), pair=null, cands={};
+      stats.forEach(function(x){ if(x.type==='local-candidate'||x.type==='remote-candidate') cands[x.id]=x; });
+      stats.forEach(function(x){ if(x.type==='candidate-pair' && x.nominated && x.state==='succeeded') pair=x; });
+      if(!pair){ stats.forEach(function(x){ if(x.type==='transport' && x.selectedCandidatePairId) pair=stats.get(x.selectedCandidatePairId); }); }
+      if(pair){
+        var l=cands[pair.localCandidateId]||{}, rm=cands[pair.remoteCandidateId]||{};
+        var rtt=(pair.currentRoundTripTime!=null)?Math.round(pair.currentRoundTripTime*1000)+'ms':'?';
+        stEl.textContent=(l.candidateType||'?')+'↔'+(rm.candidateType||'?')+' rtt '+rtt;
+      }
+    }catch(e){}
+  }, 1000);
 })();
 </script>
 </body></html>`;
