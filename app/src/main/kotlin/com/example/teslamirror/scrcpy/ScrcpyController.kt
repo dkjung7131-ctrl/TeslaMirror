@@ -47,10 +47,7 @@ class ScrcpyController(
     fun start() {
         running = true
         val adb = AdbManager.getInstance(context)
-        if (!adb.isConnected) {
-            // 무선 디버깅이 켜져 있으면 mDNS로 자기 adbd 자동 탐색 (페어링은 사전 완료 가정)
-            check(adb.autoConnect(context, 10_000)) { "ADB 자동 연결 실패 — 무선 디버깅/페어링을 확인하세요" }
-        }
+        check(adb.ensureConnected(context)) { "ADB 연결 실패 — 무선 디버깅/페어링을 확인하세요" }
 
         // 1) 서버 푸시
         val jar = context.assets.open(ASSET_NAME).use { it.readBytes() }

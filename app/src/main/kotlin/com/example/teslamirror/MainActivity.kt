@@ -122,9 +122,11 @@ fun HomeScreen() {
     var checking by remember { mutableStateOf(false) }
     var downloadProgress by remember { mutableStateOf<Int?>(null) }  // null = 다운로드 중 아님
 
-    // 앱 실행 시 1회 조용히 업데이트 확인 (실패는 무시)
+    // 앱 실행 시 1회 조용히 업데이트 확인 (실패는 무시). 디버그 빌드는 생략.
     LaunchedEffect(Unit) {
-        runCatching { UpdateChecker.checkForUpdate(context) }.getOrNull()?.let { updateInfo = it }
+        if (!context.packageName.endsWith(".debug")) {
+            runCatching { UpdateChecker.checkForUpdate(context) }.getOrNull()?.let { updateInfo = it }
+        }
     }
 
     // 접속 URL을 2초마다 실시간 갱신 — Wi-Fi/핫스팟을 켜고 끄면 화면이 바로 따라감.

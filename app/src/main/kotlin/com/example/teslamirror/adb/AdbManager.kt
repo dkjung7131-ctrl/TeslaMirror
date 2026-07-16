@@ -105,6 +105,17 @@ class AdbManager private constructor(context: Context) : AbsAdbConnectionManager
     }
 
     /**
+     * ADB 연결 보장.
+     *  1) 무선 디버깅(mDNS 자동 탐색) — 실사용 경로
+     *  2) 실패 시 클래식 ADB over TCP(127.0.0.1:5555) — `adb tcpip 5555` 검증/폴백용
+     */
+    fun ensureConnected(context: Context): Boolean {
+        if (isConnected) return true
+        runCatching { if (autoConnect(context, 5_000)) return true }
+        return runCatching { connect("127.0.0.1", 5555) }.getOrDefault(false)
+    }
+
+    /**
      * 바이트 배열을 원격 경로로 푸시한다 (`exec:cat > path`).
      * scrcpy-server.jar를 /data/local/tmp에 밀어넣는 용도.
      */
