@@ -6,10 +6,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
@@ -20,9 +16,8 @@ import android.util.Log
 import android.view.WindowManager
 import java.net.NetworkInterface
 import androidx.core.app.NotificationCompat
-import com.example.teslamirror.capture.MjpegCapturer
 import com.example.teslamirror.rendezvous.RendezvousUpdater
-import com.example.teslamirror.server.MirrorServer
+import com.example.teslamirror.webrtc.WebRtcSession
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -61,6 +56,9 @@ class ScreenCaptureService : Service() {
         val isRunningFlow: StateFlow<Boolean> = _isRunningFlow.asStateFlow()
         val isRunning: Boolean get() = _isRunningFlow.value
 
+        private val _statusFlow = MutableStateFlow("")
+        val statusFlow: StateFlow<String> = _statusFlow.asStateFlow()
+
         fun start(context: Context, resultCode: Int, data: Intent, fps: Int) {
             val i = Intent(context, ScreenCaptureService::class.java).apply {
                 putExtra(EXTRA_RESULT_CODE, resultCode)
@@ -76,8 +74,8 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private var webRtcSession: com.example.teslamirror.webrtc.WebRtcSession? = null
+    private var scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var webRtcSession: WebRtcSession? = null
 
     // 안전장치: 6시간 강제 종료 + 네트워크 끊김 감지
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -152,6 +150,9 @@ class ScreenCaptureService : Service() {
         }
 
         try {
+            if (scope.coroutineContext[kotlinx.coroutines.Job]?.isActive != true) {
+                scope = CoroutineScope(Dispatchers.Default + SupervisorJob())  // 재시작 대비 재생성
+            }
             startProjection(resultCode, data, fps)
             _isRunningFlow.value = true
             mainHandler.postDelayed(autoStopRunnable, AUTO_STOP_MS)
@@ -176,14 +177,15 @@ class ScreenCaptureService : Service() {
         }
         val (w, h, _) = displayParams()
         val (capW, capH) = scaleTo720p(w, h)
-        webRtcSession = com.example.teslamirror.webrtc.WebRtcSession(
+        webRtcSession = WebRtcSession(
             context = this,
             resultCode = resultCode,
             projectionData = data,
             width = capW,
             height = capH,
             fps = fps,
-            onStatus = { Log.i(TAG, "webrtc: $it") },
+            onStatus = { _statusFlow.value = it },
+            onProjectionLost = { stopEverything(); stopSelf() },
         ).also { it.start() }
     }
 
@@ -225,6 +227,7 @@ class ScreenCaptureService : Service() {
         unregisterHotspotReceiver()
         try { webRtcSession?.stop() } catch (_: Throwable) {}
         webRtcSession = null
+        _statusFlow.value = ""
         scope.cancel()
     }
 
@@ -258,7 +261,7 @@ class ScreenCaptureService : Service() {
         )
         val notif = NotificationCompat.Builder(this, NOTIF_CHANNEL)
             .setContentTitle("TeslaMirror 동작 중")
-            .setContentText("테슬라 브라우저에서 폰 IP로 접속하세요")
+            .setContentText("테슬라 브라우저에서 공용 주소로 접속하세요")
             .setSmallIcon(R.drawable.ic_notification_mirror)
             .setOngoing(true)
             .addAction(0, "중지", stopPi)

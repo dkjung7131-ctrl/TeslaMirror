@@ -98,7 +98,6 @@ class AppCastService : Service() {
 
         val srv = MirrorServer(
             port = HttpConfig.PORT,
-            appMode = true,
             videoWidth = DISPLAY_WIDTH,
             videoHeight = DISPLAY_HEIGHT,
             onInput = { json -> handleInput(json) },

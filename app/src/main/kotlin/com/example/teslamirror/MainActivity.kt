@@ -59,6 +59,7 @@ fun HomeScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val running by ScreenCaptureService.isRunningFlow.collectAsState()
+    val fsStatus by ScreenCaptureService.statusFlow.collectAsState()
     var fps by remember { mutableStateOf(30) }
     var ipText by remember { mutableStateOf("확인 중…") }
 
@@ -134,7 +135,7 @@ fun HomeScreen() {
     LaunchedEffect(Unit) {
         while (true) {
             val cands = withContext(Dispatchers.IO) { localIpCandidates() }
-            ipText = formatViewerUrls(cands, showWorkerUrl = regConfigured)
+            ipText = formatViewerUrls(cands, webrtcMode = !appMode, secretConfigured = regConfigured)
             val hotspotIp = cands.firstOrNull { it.isHotspot }?.ip
             if (hotspotIp != null) {
                 RendezvousUpdater.pushIfChanged(context, hotspotIp)?.let { regStatus = it }
@@ -227,7 +228,7 @@ fun HomeScreen() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             ScreenCaptureService.start(context, result.resultCode, result.data!!, fps)
-            ipText = formatViewerUrls(localIpCandidates(), showWorkerUrl = regConfigured)
+            ipText = formatViewerUrls(localIpCandidates(), webrtcMode = !appMode, secretConfigured = regConfigured)
         }
     }
 
@@ -440,7 +441,13 @@ fun HomeScreen() {
         if (!running) {
             Button(
                 onClick = {
-                    if (!isHotspotEnabled(context)) {
+                    if (!regConfigured) {
+                        Toast.makeText(
+                            context,
+                            "공용 접속 주소 시크릿을 먼저 저장하세요 (아래 카드)",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } else if (!isHotspotEnabled(context)) {
                         Toast.makeText(
                             context,
                             "핫스팟을 먼저 켜주세요",
@@ -489,6 +496,9 @@ fun HomeScreen() {
                     fontWeight = FontWeight.SemiBold
                 )
             }
+        }
+        if (running && fsStatus.isNotBlank()) {
+            Text(fsStatus, fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         }
 
@@ -570,18 +580,19 @@ fun HomeScreen() {
 
 internal data class IpCandidate(val ip: String, val isHotspot: Boolean)
 
-private fun formatViewerUrls(cands: List<IpCandidate>, showWorkerUrl: Boolean): String {
+private fun formatViewerUrls(cands: List<IpCandidate>, webrtcMode: Boolean, secretConfigured: Boolean): String {
+    // 전체화면(WebRTC) 모드: 유일한 접속 경로는 공용 워커 주소. 로컬 IP:8080은 이 모드에서
+    // 아무것도 서빙하지 않으므로 표시하지 않는다(테슬라도 사설 IP는 차단).
+    if (webrtcMode) {
+        return if (secretConfigured) RendezvousUpdater.WORKER_URL
+        else "먼저 아래 '공용 접속 주소'에 시크릿을 저장하세요"
+    }
+    // 앱 모드: 로컬 서버(H.264/WS)가 8080에서 뜨므로 로컬 주소 표시.
     val port = if (HttpConfig.PORT == 80) "" else ":${HttpConfig.PORT}"
     val hotspot = cands.filter { it.isHotspot }
-    // 핫스팟이 켜져 있으면 핫스팟 주소만, 없으면 일반 Wi-Fi 주소를 보여준다.
     val show = hotspot.ifEmpty { cands }
     if (show.isEmpty()) return "핫스팟을 켠 뒤 다시 시작하세요"
-    val urls = show.map { "http://${it.ip}$port" }.toMutableList()
-    // 시크릿이 저장돼 있고 핫스팟이 살아 있으면 접선 서버 주소를 맨 위에 — 테슬라 북마크용
-    if (showWorkerUrl && hotspot.isNotEmpty()) {
-        urls.add(0, RendezvousUpdater.WORKER_URL)
-    }
-    return urls.joinToString("\n")
+    return show.joinToString("\n") { "http://${it.ip}$port" }
 }
 
 /**

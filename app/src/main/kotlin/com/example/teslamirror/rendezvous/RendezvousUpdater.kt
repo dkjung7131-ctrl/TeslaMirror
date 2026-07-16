@@ -64,44 +64,58 @@ object RendezvousUpdater {
      * 주행 중 바뀔 수 있어, 워커가 기억하는 공인 IP를 신선하게 유지해야 한다).
      */
     suspend fun push(context: Context, ip: String): String? = withContext(Dispatchers.IO) {
-        // (디버그/릴리스가 같은 폰에서 각자 등록해도 워커가 핫스팟 IP로 중복 제거함)
+        // 디버그 빌드(.debug)는 등록하지 않는다 — 릴리스와 다른 ANDROID_ID로 워커에
+        // 중복/오등록되어 뷰어가 엉뚱한 deviceId를 물게 되는 것을 막는다.
+        if (context.packageName.endsWith(".debug")) return@withContext null
         val secret = secret(context)
         if (secret.isBlank()) return@withContext null
-        try {
-            val conn = (URL("$WORKER_URL/register").openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                doOutput = true
-                connectTimeout = 10_000
-                readTimeout = 10_000
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("Authorization", "Bearer $secret")
-            }
-            val body = JSONObject()
-                .put("deviceId", deviceId(context))
-                .put("name", Build.MODEL)
-                .put("hotspotIp", ip)
-                .toString()
-            conn.outputStream.use { it.write(body.toByteArray()) }
-            val code = conn.responseCode
-            conn.disconnect()
-            if (code == 200) {
-                lastPushedIp = ip
-                lastFailedIp = null
-                "등록 완료 — $ip (${Build.MODEL})"
-            } else {
+        val body = JSONObject()
+            .put("deviceId", deviceId(context))
+            .put("name", Build.MODEL)
+            .put("hotspotIp", ip)
+            .toString()
+        val code = runCatching { postJson(context, "/register", body) }.getOrElse { -1 }
+        when {
+            code == 200 -> { lastPushedIp = ip; lastFailedIp = null; "등록 완료 — $ip (${Build.MODEL})" }
+            else -> {
                 lastFailedIp = ip
                 lastFailedAt = SystemClock.elapsedRealtime()
-                if (code == 401) "등록 실패 — 시크릿을 확인하세요"
-                else "등록 실패 — 서버 오류 ($code)"
+                when (code) {
+                    401 -> "등록 실패 — 시크릿을 확인하세요"
+                    -1 -> "등록 실패 — 인터넷(셀룰러) 연결을 확인하세요"
+                    else -> "등록 실패 — 서버 오류 ($code)"
+                }
             }
-        } catch (_: Throwable) {
-            lastFailedIp = ip
-            lastFailedAt = SystemClock.elapsedRealtime()
-            "등록 실패 — 인터넷(셀룰러) 연결을 확인하세요"
         }
     }
 
     /** 워커 KV의 키 — 폰마다 고정이면 되고, 재설치로 바뀌어도 무방 (옛 항목은 24시간 뒤 소멸). */
-    private fun deviceId(context: Context): String =
+    fun deviceId(context: Context): String =
         Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown"
+
+    /** 워커에 인증(Bearer) POST. 응답 코드 반환. WebRtcSession 시그널링도 공유한다. */
+    suspend fun postJson(context: Context, path: String, jsonBody: String): Int = withContext(Dispatchers.IO) {
+        val conn = (URL("$WORKER_URL$path").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"; doOutput = true; connectTimeout = 10_000; readTimeout = 10_000
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Authorization", "Bearer ${secret(context)}")
+        }
+        conn.outputStream.use { it.write(jsonBody.toByteArray()) }
+        val code = conn.responseCode
+        conn.disconnect()
+        code
+    }
+
+    /** 워커 GET. 200이면 본문, 아니면 null. */
+    suspend fun getBody(path: String): String? = withContext(Dispatchers.IO) {
+        val conn = (URL("$WORKER_URL$path").openConnection() as HttpURLConnection).apply {
+            connectTimeout = 8_000; readTimeout = 8_000
+        }
+        try {
+            if (conn.responseCode == 200) conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
+            else null
+        } finally {
+            conn.disconnect()
+        }
+    }
 }

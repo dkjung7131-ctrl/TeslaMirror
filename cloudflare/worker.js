@@ -95,12 +95,8 @@ function json200(obj) {
 function html(s) { return new Response(s, { headers: { 'content-type': 'text/html; charset=utf-8' } }); }
 
 async function listPhones(env) {
-  const raw = [];
   const list = await env.PHONES.list({ prefix: 'dev:' });
-  for (const k of list.keys) {
-    const v = await env.PHONES.get(k.name, 'json');
-    if (v) raw.push(v);
-  }
+  const raw = (await Promise.all(list.keys.map((k) => env.PHONES.get(k.name, 'json')))).filter(Boolean);
   raw.sort((a, b) => b.ts - a.ts);
   // 같은 폰이 여러 deviceId(릴리스/디버그 서명키 차이)로 등록될 수 있어 핫스팟 IP로 중복 제거
   const entries = [], seen = new Set();
@@ -182,7 +178,7 @@ function viewerHtml(deviceId) {
 <div id="st"></div>
 <script>
 (function(){
-  var DEVICE_ID=${JSON.stringify(String(deviceId))};
+  var DEVICE_ID=${JSON.stringify(String(deviceId)).replace(/</g, '\\u003c')};
   var s=document.getElementById('s'), stEl=document.getElementById('st');
   var canvas=document.getElementById('c'), ctx=canvas.getContext('2d');
   function st(t){ s.style.display=t?'':'none'; s.textContent=t||''; }

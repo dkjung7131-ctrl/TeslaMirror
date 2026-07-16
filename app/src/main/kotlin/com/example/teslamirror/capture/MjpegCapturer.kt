@@ -23,6 +23,9 @@ class MjpegCapturer(
     private val height: Int,
     private val fps: Int = 15,
     private val quality: Int = 65,
+    // false를 반환하면 그 틱은 JPEG 인코딩 자체를 건너뛴다(뷰어 없음/버퍼 백프레셔 시
+    // CPU·발열 낭비 방지). 기본은 항상 인코딩.
+    private val shouldEncode: () -> Boolean = { true },
     private val onFrame: (ByteArray) -> Unit
 ) {
 
@@ -78,7 +81,7 @@ class MjpegCapturer(
                     }
                     currentBitmap  // 새 프레임 없으면 같은 비트맵 재송신
                 }
-                if (bmp != null) {
+                if (bmp != null && shouldEncode()) {
                     baos.reset()
                     bmp.compress(Bitmap.CompressFormat.JPEG, quality, baos)
                     onFrame(baos.toByteArray())

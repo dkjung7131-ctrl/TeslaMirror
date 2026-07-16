@@ -7,26 +7,21 @@ import io.ktor.server.netty.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.*
-import io.ktor.utils.io.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * 내장 Ktor 서버.
+ * 앱(H.264) 모드 전용 내장 Ktor 서버 (AppCastService에서 사용).
  *
- * MJPEG(전체화면) 모드:
- *   - GET /         → 시계 뷰어 HTML
- *   - GET /stream   → MJPEG multipart 스트림
+ *   - GET /   → WebCodecs 뷰어 HTML
+ *   - WS  /ws → H.264 패킷 하향(config/key/delta) + 입력 이벤트 상향(JSON)
  *
- * 앱(H.264) 모드:
- *   - GET /         → WebCodecs 뷰어 HTML
- *   - WS  /ws       → H.264 패킷 하향(config/key/delta) + 입력 이벤트 상향(JSON)
+ * 전체화면 모드는 로컬 서버가 아니라 WebRTC 데이터채널(WebRtcSession)로 전환됨.
  */
 class MirrorServer(
     private val port: Int,
-    private val appMode: Boolean = false,
     private val videoWidth: Int = 0,
     private val videoHeight: Int = 0,
     private val onInput: ((String) -> Unit)? = null,
@@ -34,14 +29,6 @@ class MirrorServer(
 ) {
 
     private var engine: ApplicationEngine? = null
-
-    // --- MJPEG ---
-    private data class MjpegClient(val ch: Channel<ByteArray>)
-    private val mjpegClients = CopyOnWriteArrayList<MjpegClient>()
-
-    fun broadcastMjpeg(jpeg: ByteArray) {
-        for (c in mjpegClients) c.ch.trySend(jpeg)
-    }
 
     // --- H.264 ---
     // 프레이밍: byte[0] = 0(config) | 1(key) | 2(delta), 이후 Annex-B 페이로드
@@ -72,45 +59,12 @@ class MirrorServer(
 
     fun start() {
         engine = embeddedServer(Netty, port = port, host = "0.0.0.0") {
-            if (appMode) {
-                install(WebSockets)
-                routing {
-                    get("/") { call.respondText(AppViewerHtml.HTML, ContentType.Text.Html) }
-                    webSocket("/ws") { serveH264(this) }
-                }
-            } else {
-                routing {
-                    get("/") { call.respondText(ViewerHtml.HTML, ContentType.Text.Html) }
-                    get("/stream") { serveMjpeg(call) }
-                }
+            install(WebSockets)
+            routing {
+                get("/") { call.respondText(AppViewerHtml.HTML, ContentType.Text.Html) }
+                webSocket("/ws") { serveH264(this) }
             }
         }.also { it.start(wait = false) }
-    }
-
-    private suspend fun serveMjpeg(call: ApplicationCall) {
-        val boundary = "tmboundary"
-        call.response.header("Cache-Control", "no-cache, private")
-        call.response.header("Pragma", "no-cache")
-        call.response.header("Connection", "close")
-        val client = MjpegClient(Channel(Channel.CONFLATED))
-        mjpegClients.add(client)
-        try {
-            call.respondBytesWriter(
-                contentType = ContentType.parse("multipart/x-mixed-replace; boundary=$boundary")
-            ) {
-                writeStringUtf8("--$boundary\r\n")
-                while (!isClosedForWrite) {
-                    val jpeg = client.ch.receive()
-                    writeStringUtf8("Content-Type: image/jpeg\r\nContent-Length: ${jpeg.size}\r\n\r\n")
-                    writeFully(jpeg)
-                    writeStringUtf8("\r\n--$boundary\r\n")
-                    flush()
-                }
-            }
-        } catch (_: Throwable) {
-        } finally {
-            mjpegClients.remove(client)
-        }
     }
 
     private suspend fun serveH264(session: DefaultWebSocketServerSession) {
@@ -144,8 +98,6 @@ class MirrorServer(
     fun stop() {
         runCatching { engine?.stop(500, 1500) }
         engine = null
-        mjpegClients.forEach { runCatching { it.ch.close() } }
-        mjpegClients.clear()
         h264Clients.forEach { runCatching { it.ch.close() } }
         h264Clients.clear()
         lastConfig = null
