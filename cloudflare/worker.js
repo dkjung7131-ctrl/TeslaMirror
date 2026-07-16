@@ -42,21 +42,31 @@ export default {
     }
 
     if (request.method === 'GET') {
-      const entries = [];
+      const raw = [];
       const list = await env.PHONES.list({ prefix: 'dev:' });
       for (const k of list.keys) {
         const v = await env.PHONES.get(k.name, 'json');
-        if (v) entries.push(v);
+        if (v) raw.push(v);
       }
-      entries.sort((a, b) => b.ts - a.ts);
+      raw.sort((a, b) => b.ts - a.ts);  // 최신 등록 우선
+
+      // 같은 폰이 여러 deviceId로 등록될 수 있다(앱 릴리스/디버그 변형은 서명키가 달라
+      // ANDROID_ID가 다름). 현재 핫스팟 IP가 같으면 같은 폰으로 보고 최신 것만 남긴다.
+      const entries = [];
+      const seenIp = new Set();
+      for (const e of raw) {
+        if (!e.hotspotIp || seenIp.has(e.hotspotIp)) continue;
+        seenIp.add(e.hotspotIp);
+        entries.push(e);
+      }
 
       const myIp = request.headers.get('CF-Connecting-IP') || '';
       const matches = entries.filter((e) => samePeer(e.publicIp, myIp));
-      // 공인 IP가 정확히 한 폰과 일치하면 바로 그 폰으로.
-      // 일치하는 폰이 없어도 등록된 폰이 하나뿐이면 그 폰으로 (1대 사용자의 CGNAT 변수 흡수).
+      // 공인 IP 일치가 있으면 가장 최근 등록으로 바로 이동(같은 폰 중복 흡수).
+      // 일치가 없어도 폰이 하나뿐이면 그 폰으로 (CGNAT로 공인 IP가 어긋나는 경우).
       const pick =
-        matches.length === 1 ? matches[0]
-        : matches.length === 0 && entries.length === 1 ? entries[0]
+        matches.length >= 1 ? matches[0]
+        : entries.length === 1 ? entries[0]
         : null;
       if (pick) {
         return Response.redirect(`http://${pick.hotspotIp}:${MIRROR_PORT}/`, 302);

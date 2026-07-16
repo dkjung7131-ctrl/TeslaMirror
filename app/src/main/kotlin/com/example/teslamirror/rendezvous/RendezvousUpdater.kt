@@ -64,6 +64,9 @@ object RendezvousUpdater {
      * 주행 중 바뀔 수 있어, 워커가 기억하는 공인 IP를 신선하게 유지해야 한다).
      */
     suspend fun push(context: Context, ip: String): String? = withContext(Dispatchers.IO) {
+        // 디버그 빌드(.debug)는 접선 서버에 등록하지 않는다 — 개발용 설치가
+        // 실사용 릴리스와 별개 deviceId로 목록을 오염시키는 것을 방지.
+        if (context.packageName.endsWith(".debug")) return@withContext null
         val secret = secret(context)
         if (secret.isBlank()) return@withContext null
         try {
