@@ -115,13 +115,23 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// 등록이 얼마나 오래됐는지 — 낡은 항목(핫스팟 재시작 전 IP)을 알아볼 수 있게
+function ageText(ts) {
+  const m = Math.floor((Date.now() - ts) / 60000);
+  if (m < 1) return '방금 등록';
+  if (m < 60) return m + '분 전 등록';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + '시간 전 등록';
+  return Math.floor(h / 24) + '일 전 등록';
+}
+
 // 자동 매칭이 안 될 때: 폰 목록을 큰 버튼으로 — 테슬라 터치스크린 기준
 function chooserHtml(entries) {
   const items = entries
     .map(
       (e) =>
         `<a class="btn" href="http://${e.hotspotIp}:${MIRROR_PORT}/">` +
-        `${escapeHtml(e.name)}<span>${e.hotspotIp}</span></a>`
+        `${escapeHtml(e.name)}<span>${e.hotspotIp} · ${ageText(e.ts)}</span></a>`
     )
     .join('\n');
   return `<!doctype html>
