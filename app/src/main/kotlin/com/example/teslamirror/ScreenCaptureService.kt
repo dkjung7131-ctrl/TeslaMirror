@@ -77,10 +77,7 @@ class ScreenCaptureService : Service() {
     }
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private var projection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var mjpegCapturer: MjpegCapturer? = null
-    private var server: MirrorServer? = null
+    private var webRtcSession: com.example.teslamirror.webrtc.WebRtcSession? = null
 
     // 안전장치: 6시간 강제 종료 + 네트워크 끊김 감지
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -171,30 +168,22 @@ class ScreenCaptureService : Service() {
     }
 
     private fun startProjection(resultCode: Int, data: Intent, fps: Int) {
-        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projection = mpm.getMediaProjection(resultCode, data).also {
-            it.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() { stopEverything(); stopSelf() }
-            }, null)
+        // 테슬라 브라우저는 사설 IP 직접 접속을 막으므로 MJPEG(로컬 서버) 대신
+        // WebRTC로 공개 페이지를 거쳐 로컬 P2P 연결한다. 시그널링에 접선 서버 시크릿 필요.
+        if (!RendezvousUpdater.isConfigured(this)) {
+            Log.w(TAG, "rendezvous secret not set — WebRTC signaling unavailable")
+            throw IllegalStateException("공용 접속 주소 시크릿을 먼저 저장하세요")
         }
-
-        val (w, h, dpi) = displayParams()
+        val (w, h, _) = displayParams()
         val (capW, capH) = scaleTo720p(w, h)
-
-        val server = MirrorServer(HttpConfig.PORT).also { this.server = it }
-        server.start()
-
-        val cap = MjpegCapturer(capW, capH, fps = fps, quality = 65) { jpegBytes ->
-            server.broadcastMjpeg(jpegBytes)
-        }
-        mjpegCapturer = cap
-        virtualDisplay = projection!!.createVirtualDisplay(
-            "TeslaMirror-MJPEG",
-            capW, capH, dpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            cap.surface, null, null
-        )
-        cap.start(scope)
+        webRtcSession = com.example.teslamirror.webrtc.WebRtcSession(
+            context = this,
+            projectionData = data,
+            width = capW,
+            height = capH,
+            fps = fps,
+            onStatus = { Log.i(TAG, "webrtc: $it") },
+        ).also { it.start() }
     }
 
     // 미러링 도중에도 접선 서버에 주기적으로 재등록 — MainActivity의 2초 루프는
@@ -233,12 +222,8 @@ class ScreenCaptureService : Service() {
         mainHandler.removeCallbacks(autoStopRunnable)
         mainHandler.removeCallbacks(networkCheckRunnable)
         unregisterHotspotReceiver()
-        try { mjpegCapturer?.stop() } catch (_: Throwable) {}
-        try { virtualDisplay?.release() } catch (_: Throwable) {}
-        try { projection?.stop() } catch (_: Throwable) {}
-        try { server?.stop() } catch (_: Throwable) {}
-        mjpegCapturer = null
-        virtualDisplay = null; projection = null; server = null
+        try { webRtcSession?.stop() } catch (_: Throwable) {}
+        webRtcSession = null
         scope.cancel()
     }
 

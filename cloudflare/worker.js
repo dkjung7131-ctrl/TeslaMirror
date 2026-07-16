@@ -1,104 +1,124 @@
-// TeslaMirror 접선(rendezvous) 서버 — Cloudflare Worker
+// TeslaMirror 시그널링 서버 — Cloudflare Worker
 //
-// 폰: 핫스팟 IP가 바뀔 때마다 POST /register 로 자기 IP를 등록
-// 테슬라: GET / 하나만 북마크 — 워커가 요청의 공인 IP를 보고
-//        "이 테슬라가 붙어 있는 폰"의 핫스팟 IP로 302 리다이렉트
+// 테슬라 브라우저는 사설 IP(10.x/192.168.x) 직접 접속을 막는다(about:blank#blocked).
+// 그래서 공개 HTTPS 페이지를 워커가 서빙하고, 폰↔테슬라를 WebRTC로 P2P 연결한다.
+// ICE가 같은 핫스팟의 로컬 경로를 찾으므로 영상은 로컬 직통(저지연·무과금)으로 흐르고,
+// 페이지 origin은 공개라 사설 IP 차단을 원천 회피한다. (Tesor와 동일한 접근)
 //
-// 원리: 테슬라의 인터넷 트래픽은 폰 핫스팟 → 폰 셀룰러로 나가므로,
-// 폰의 등록 요청과 그 폰에 붙은 테슬라의 접속 요청은 같은 공인 IP로 보인다.
-// 매칭이 애매하면(통신사 CGNAT 변수) 등록된 폰 목록을 버튼으로 보여준다.
+// 엔드포인트:
+//   POST /register  {deviceId,name,hotspotIp}  (Bearer SECRET) — 폰 등록(발견용)
+//   GET  /                                       — 뷰어 페이지(공인 IP로 폰 자동 선택)
+//   GET  /?id=<deviceId>                         — 특정 폰 뷰어
+//   POST /offer     {deviceId,offerId,sdp}      (Bearer SECRET) — 폰이 오퍼 게시
+//   GET  /offer?id=<deviceId>                    — 테슬라가 오퍼 가져감
+//   POST /answer    {deviceId,offerId,sdp}       — 테슬라가 앤서 게시
+//   GET  /answer?id=<deviceId>                   — 폰이 앤서 폴링
 //
-// 필요한 바인딩 (DEPLOY.md 참고):
-//   KV namespace: PHONES
-//   Secret:       SECRET (앱에 입력하는 값과 동일)
+// 바인딩: KV namespace PHONES, Secret SECRET
 
-const MIRROR_PORT = 8080;
+const SIGNAL_TTL = 120; // 초
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const p = url.pathname;
 
-    if (url.pathname === '/register' && request.method === 'POST') {
-      if ((request.headers.get('Authorization') || '') !== `Bearer ${env.SECRET}`) {
-        return new Response('unauthorized', { status: 401 });
-      }
-      let body;
-      try { body = await request.json(); } catch { return new Response('bad json', { status: 400 }); }
+    // ---- 폰 등록 (발견용) ----
+    if (p === '/register' && request.method === 'POST') {
+      if (!authed(request, env)) return new Response('unauthorized', { status: 401 });
+      const body = await json(request);
       const { deviceId, name, hotspotIp } = body || {};
-      if (!deviceId || !isPrivateIpv4(hotspotIp)) {
-        return new Response('bad request', { status: 400 });
-      }
+      if (!deviceId) return new Response('bad request', { status: 400 });
       const entry = {
+        deviceId: String(deviceId).slice(0, 64),
         name: String(name || 'phone').slice(0, 40),
-        hotspotIp,
+        hotspotIp: hotspotIp || '',
         publicIp: request.headers.get('CF-Connecting-IP') || '',
         ts: Date.now(),
       };
-      // 24시간 뒤 자동 소멸 — 오래 안 쓴 폰은 목록에서 사라진다
-      await env.PHONES.put('dev:' + String(deviceId).slice(0, 64), JSON.stringify(entry), {
-        expirationTtl: 86400,
-      });
+      await env.PHONES.put('dev:' + entry.deviceId, JSON.stringify(entry), { expirationTtl: 86400 });
       return new Response('OK');
     }
 
-    if (request.method === 'GET') {
-      const raw = [];
-      const list = await env.PHONES.list({ prefix: 'dev:' });
-      for (const k of list.keys) {
-        const v = await env.PHONES.get(k.name, 'json');
-        if (v) raw.push(v);
-      }
-      raw.sort((a, b) => b.ts - a.ts);  // 최신 등록 우선
+    // ---- WebRTC 시그널링 ----
+    if (p === '/offer' && request.method === 'POST') {
+      if (!authed(request, env)) return new Response('unauthorized', { status: 401 });
+      const b = await json(request);
+      if (!b || !b.deviceId || !b.sdp) return new Response('bad request', { status: 400 });
+      await env.PHONES.put('offer:' + b.deviceId, JSON.stringify({ offerId: b.offerId, sdp: b.sdp, ts: Date.now() }), { expirationTtl: SIGNAL_TTL });
+      return json200({ ok: true });
+    }
+    if (p === '/offer' && request.method === 'GET') {
+      const id = url.searchParams.get('id');
+      const v = id ? await env.PHONES.get('offer:' + id, 'json') : null;
+      if (!v) return new Response('no offer', { status: 404 });
+      return json200(v);
+    }
+    if (p === '/answer' && request.method === 'POST') {
+      const b = await json(request);
+      if (!b || !b.deviceId || !b.sdp) return new Response('bad request', { status: 400 });
+      await env.PHONES.put('answer:' + b.deviceId, JSON.stringify({ offerId: b.offerId, sdp: b.sdp, ts: Date.now() }), { expirationTtl: SIGNAL_TTL });
+      return json200({ ok: true });
+    }
+    if (p === '/answer' && request.method === 'GET') {
+      const id = url.searchParams.get('id');
+      const v = id ? await env.PHONES.get('answer:' + id, 'json') : null;
+      if (!v) return new Response('no answer', { status: 404 });
+      return json200(v);
+    }
 
-      // 같은 폰이 여러 deviceId로 등록될 수 있다(앱 릴리스/디버그 변형은 서명키가 달라
-      // ANDROID_ID가 다름). 현재 핫스팟 IP가 같으면 같은 폰으로 보고 최신 것만 남긴다.
-      const entries = [];
-      const seenIp = new Set();
-      for (const e of raw) {
-        if (!e.hotspotIp || seenIp.has(e.hotspotIp)) continue;
-        seenIp.add(e.hotspotIp);
-        entries.push(e);
+    // ---- 뷰어 페이지 ----
+    if (p === '/' && request.method === 'GET') {
+      const forced = url.searchParams.get('id');
+      if (forced) {
+        return html(viewerHtml(forced));
       }
-
+      const entries = await listPhones(env);
       const myIp = request.headers.get('CF-Connecting-IP') || '';
       const matches = entries.filter((e) => samePeer(e.publicIp, myIp));
-      // 공인 IP 일치가 있으면 가장 최근 등록으로 바로 이동(같은 폰 중복 흡수).
-      // 일치가 없어도 폰이 하나뿐이면 그 폰으로 (CGNAT로 공인 IP가 어긋나는 경우).
-      const pick =
-        matches.length >= 1 ? matches[0]
-        : entries.length === 1 ? entries[0]
-        : null;
-      if (pick) {
-        return Response.redirect(`http://${pick.hotspotIp}:${MIRROR_PORT}/`, 302);
-      }
-      return new Response(chooserHtml(entries, myIp), {
-        headers: { 'content-type': 'text/html; charset=utf-8' },
-      });
+      const pick = matches.length >= 1 ? matches[0] : entries.length === 1 ? entries[0] : null;
+      if (pick) return html(viewerHtml(pick.deviceId));
+      return html(chooserHtml(entries, myIp));
     }
 
     return new Response('not found', { status: 404 });
   },
 };
 
-function isPrivateIpv4(ip) {
-  if (typeof ip !== 'string') return false;
-  const m = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (!m) return false;
-  const [a, b, c, d] = m.slice(1).map(Number);
-  if ([a, b, c, d].some((n) => n > 255)) return false;
-  return a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+function authed(request, env) {
+  return (request.headers.get('Authorization') || '') === `Bearer ${env.SECRET}`;
+}
+async function json(request) { try { return await request.json(); } catch { return null; } }
+function json200(obj) {
+  return new Response(JSON.stringify(obj), { headers: { 'content-type': 'application/json' } });
+}
+function html(s) { return new Response(s, { headers: { 'content-type': 'text/html; charset=utf-8' } }); }
+
+async function listPhones(env) {
+  const raw = [];
+  const list = await env.PHONES.list({ prefix: 'dev:' });
+  for (const k of list.keys) {
+    const v = await env.PHONES.get(k.name, 'json');
+    if (v) raw.push(v);
+  }
+  raw.sort((a, b) => b.ts - a.ts);
+  // 같은 폰이 여러 deviceId(릴리스/디버그 서명키 차이)로 등록될 수 있어 핫스팟 IP로 중복 제거
+  const entries = [], seen = new Set();
+  for (const e of raw) {
+    const key = e.hotspotIp || e.deviceId;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push(e);
+  }
+  return entries;
 }
 
-// 같은 폰 뒤에서 나온 트래픽인지 판단.
-// IPv4는 정확히 일치해야 하고, IPv6는 /64 프리픽스만 비교한다
-// (통신사 IPv6는 같은 단말이라도 뒷부분 주소가 요청마다 다를 수 있음).
 function samePeer(a, b) {
   if (!a || !b) return false;
   if (a === b) return true;
   if (a.includes(':') && b.includes(':')) return prefix64(a) === prefix64(b);
   return false;
 }
-
 function prefix64(ip6) {
   const parts = ip6.split('::');
   let head = parts[0] ? parts[0].split(':') : [];
@@ -108,14 +128,9 @@ function prefix64(ip6) {
   }
   return head.slice(0, 4).map((h) => h.padStart(4, '0')).join(':').toLowerCase();
 }
-
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
-
-// 등록이 얼마나 오래됐는지 — 낡은 항목(핫스팟 재시작 전 IP)을 알아볼 수 있게
 function ageText(ts) {
   const m = Math.floor((Date.now() - ts) / 60000);
   if (m < 1) return '방금 등록';
@@ -125,36 +140,77 @@ function ageText(ts) {
   return Math.floor(h / 24) + '일 전 등록';
 }
 
-// 자동 매칭이 안 될 때: 폰 목록을 큰 버튼으로 — 테슬라 터치스크린 기준.
-// 각 항목에 "이 브라우저와 같은 네트워크(공인 IP 일치)인지"를 표시해
-// 차가 엉뚱한 Wi-Fi에 붙은 경우를 현장에서 바로 알 수 있게 한다.
 function chooserHtml(entries, myIp) {
   const items = entries
     .map((e) => {
       const same = samePeer(e.publicIp, myIp);
       const badge = same
         ? '<b style="color:#4ade80">✓ 이 화면과 같은 네트워크</b>'
-        : '<b style="color:#fbbf24">⚠ 다른 네트워크 — 이 폰 핫스팟에 연결돼 있지 않음</b>';
-      return (
-        `<a class="btn" href="http://${e.hotspotIp}:${MIRROR_PORT}/">` +
-        `${escapeHtml(e.name)}<span>${e.hotspotIp} · ${ageText(e.ts)}</span>${badge}</a>`
-      );
+        : '<b style="color:#fbbf24">⚠ 다른 네트워크</b>';
+      return `<a class="btn" href="/?id=${encodeURIComponent(e.deviceId)}">${escapeHtml(e.name)}<span>${ageText(e.ts)}</span>${badge}</a>`;
     })
     .join('\n');
   return `<!doctype html>
-<html lang="ko"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TeslaMirror</title>
-<style>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TeslaMirror</title><style>
   body{font-family:sans-serif;background:#111;color:#eee;display:flex;flex-direction:column;align-items:center;padding:40px 16px;gap:16px}
   h1{font-size:28px;margin:0 0 8px}
   .btn{display:flex;flex-direction:column;gap:4px;width:100%;max-width:480px;background:#2563eb;color:#fff;text-decoration:none;padding:22px 24px;border-radius:14px;font-size:24px;font-weight:600;text-align:center}
-  .btn span{font-size:15px;font-weight:400;opacity:.8}
-  .btn b{font-size:14px;font-weight:600}
+  .btn span{font-size:15px;font-weight:400;opacity:.8}.btn b{font-size:14px;font-weight:600}
   p{opacity:.7;font-size:17px}
 </style></head><body>
 <h1>TeslaMirror</h1>
 ${items || '<p>등록된 폰이 없습니다.<br>폰에서 핫스팟을 켜고 앱을 실행하세요.</p>'}
 ${items ? '<p>접속할 폰을 선택하세요</p>' : ''}
+</body></html>`;
+}
+
+// WebRTC 뷰어 — 공개 HTTPS 페이지. 폰의 오퍼를 받아 앤서를 올리고 로컬 P2P로 영상 재생.
+function viewerHtml(deviceId) {
+  return `<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>TeslaMirror</title><style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:sans-serif;color:#fff}
+  #v{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+  #s{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);font-size:20px;opacity:.85;text-align:center;line-height:1.6}
+</style></head><body>
+<video id="v" playsinline autoplay muted></video>
+<div id="s">연결 중…</div>
+<script>
+(function(){
+  var DEVICE_ID=${JSON.stringify(String(deviceId))};
+  var v=document.getElementById('v'), s=document.getElementById('s');
+  function st(t){ s.style.display=t?'':'none'; s.textContent=t||''; }
+  function iceDone(pc){ return new Promise(function(res){
+    if(pc.iceGatheringState==='complete') return res();
+    var t=setTimeout(res,3000);
+    pc.addEventListener('icegatheringstatechange',function(){ if(pc.iceGatheringState==='complete'){clearTimeout(t);res();} });
+  }); }
+  var pc=null, tries=0;
+  async function connect(){
+    try{
+      var r=await fetch('/offer?id='+encodeURIComponent(DEVICE_ID),{cache:'no-store'});
+      if(!r.ok){ st('폰 대기 중… (앱에서 미러링을 시작하세요)'); return schedule(); }
+      var offer=await r.json();
+      if(pc){ try{pc.close();}catch(e){} }
+      pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+      pc.ontrack=function(e){ v.srcObject=e.streams[0]; v.play().catch(function(){}); st(''); };
+      pc.onconnectionstatechange=function(){
+        if(pc.connectionState==='connected') st('');
+        if(pc.connectionState==='failed'||pc.connectionState==='disconnected'||pc.connectionState==='closed'){ st('재연결 중…'); schedule(); }
+      };
+      await pc.setRemoteDescription({type:'offer',sdp:offer.sdp});
+      var ans=await pc.createAnswer();
+      await pc.setLocalDescription(ans);
+      await iceDone(pc);
+      await fetch('/answer',{method:'POST',headers:{'content-type':'application/json'},
+        body:JSON.stringify({deviceId:DEVICE_ID,offerId:offer.offerId,sdp:pc.localDescription.sdp})});
+    }catch(e){ st('오류: '+e.message); schedule(); }
+  }
+  function schedule(){ tries++; setTimeout(connect, Math.min(1000+tries*500,4000)); }
+  connect();
+})();
+</script>
 </body></html>`;
 }

@@ -105,4 +105,7 @@ dependencies {
     implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
     implementation("com.github.MuntashirAkon:sun-security-android:1.1")
     implementation("org.conscrypt:conscrypt-android:2.5.3")
+
+    // WebRTC (org.webrtc) — 테슬라 브라우저로 로컬 P2P 저지연 스트리밍
+    implementation("io.getstream:stream-webrtc-android:1.3.8")
 }
