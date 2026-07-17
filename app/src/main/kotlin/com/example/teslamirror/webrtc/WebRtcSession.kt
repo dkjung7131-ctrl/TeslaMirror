@@ -221,37 +221,50 @@ class WebRtcSession(
         awaitSet("setLocal") { pc!!.setLocalDescription(it, offer) }
         withTimeoutOrNull(5000) { gathered.await() }   // 이벤트가 먼저 왔어도 즉시 반환
         val raw = pc!!.localDescription?.description ?: offer.description
+        // 사설 IPv4 host 후보만 남긴다(셀룰러/IPv6/libwebrtc가 tun에 만든 FAKE_IP 네이티브
+        // 후보까지 제거 — 후자는 소켓이 tun에 묶여 릴레이 불가). 정상 케이스엔 swlan0 후보가 남음.
         val filtered = filterToLocalCandidates(raw)
-        // 쓸 후보(사설 IPv4 + VPN 모드면 FAKE_IP)가 하나도 없으면 원본으로 폴백.
         val hasLocal = Regex("""a=candidate:""").containsMatchIn(filtered)
         if (!hasLocal) {
-            Log.w(TAG, "no usable candidate after filter — falling back to raw SDP")
+            Log.w(TAG, "no local candidate after filter — falling back to raw SDP")
             onStatus("로컬 네트워크 후보 없음 — 핫스팟 확인 (지연 가능)")
         }
-        val sdp = if (hasLocal) filtered else raw
-        // VPN 모드 진단: libwebrtc가 tun의 FAKE_IP에 host 후보를 만들었는지가 성패를 가른다.
-        val hasFake = advertiseIp != null && sdp.contains(" $advertiseIp ")
-        Log.i(TAG, "offer ready cands=${Regex("""a=candidate:""").findAll(sdp).count()} vpn=$advertiseIp fakeCandPresent=$hasFake")
-        if (advertiseIp != null && !hasFake) {
-            Log.w(TAG, "VPN mode but no $advertiseIp candidate — libwebrtc가 tun을 열거 못함(대안: 유저스페이스 릴레이 필요)")
-        }
+        val base = if (hasLocal) filtered else raw
+        // VPN 게이트웨이 모드: 남은 사설 후보의 IP를 FAKE_IP로 재작성(포트 유지). 뷰어는
+        // FAKE_IP:P로 접속 → 차 게이트웨이(폰)로 → GatewayVpnService가 tun에서 받아
+        // apAddr:P(=libwebrtc 사설 후보 소켓)로 릴레이. 포트 P가 보존돼 정확히 도달한다.
+        val sdp = advertiseIp?.let { rewriteToAdvertiseIp(base, it) } ?: base
+        Log.i(TAG, "offer ready localCands=${Regex("""a=candidate:""").findAll(base).count()} vpn=$advertiseIp")
         return sdp
     }
 
-    /**
-     * 뷰어에게 광고할 후보만 남긴다.
-     * - 기본: 사설 IPv4(로컬 핫스팟 경로) 후보만 → 셀룰러 왕복 방지.
-     * - VPN 모드([advertiseIp]≠null): 사설 IPv4 + FAKE_IP 후보 유지. 테슬라는 사설 IP를
-     *   무시하고 FAKE_IP로만 접속(=로컬 소유 주소로 배달), 핫스팟에 붙은 PC 뷰어는 사설 IP로 접속.
-     */
+    /** 사설 IPv4 host 후보만 남긴다(FAKE_IP 네이티브·IPv6·셀룰러 제거). */
     private fun filterToLocalCandidates(sdp: String): String {
         val out = sdp.split("\r\n", "\n").map { it.trimEnd('\r') }.filter { line ->
             if (!line.startsWith("a=candidate:")) return@filter true
             val addr = line.removePrefix("a=").split(' ').getOrNull(4) ?: return@filter false
-            isPrivateIpv4(addr) || addr == advertiseIp
+            isPrivateIpv4(addr)
         }
         return out.joinToString("\r\n").trimEnd() + "\r\n"
     }
+
+    /** 사설 IPv4 후보 주소와 c=IN IP4 연결선을 [ip]로 치환(포트/그 외 유지). */
+    private fun rewriteToAdvertiseIp(sdp: String, ip: String): String =
+        sdp.split("\r\n", "\n").map { it.trimEnd('\r') }.joinToString("\r\n") { line ->
+            when {
+                line.startsWith("a=candidate:") -> {
+                    val parts = line.removePrefix("a=").split(' ').toMutableList()
+                    val addr = parts.getOrNull(4)
+                    if (addr != null && isPrivateIpv4(addr)) { parts[4] = ip; "a=" + parts.joinToString(" ") }
+                    else line
+                }
+                line.startsWith("c=IN IP4 ") -> {
+                    val addr = line.removePrefix("c=IN IP4 ").trim()
+                    if (isPrivateIpv4(addr)) "c=IN IP4 $ip" else line
+                }
+                else -> line
+            }
+        }.trimEnd() + "\r\n"
 
     private fun isPrivateIpv4(a: String): Boolean {
         val m = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""").find(a) ?: return false
@@ -313,7 +326,9 @@ class WebRtcSession(
             fetchAnswer(offerId)?.let { return it }
             val now = System.currentTimeMillis()
             if (now - lastRepost > 100_000) {   // TTL(120s) 만료 전 재게시
-                postOffer(offerId, filterToLocalCandidates(pc?.localDescription?.description ?: return null))
+                val d = pc?.localDescription?.description ?: return null
+                val f = filterToLocalCandidates(d)
+                postOffer(offerId, advertiseIp?.let { rewriteToAdvertiseIp(f, it) } ?: f)
                 lastRepost = now
             }
             delay(if (now - start < 20_000) 700 else 2500)    // 접속 직후 촘촘, 이후 완화(무료 한도 절약)

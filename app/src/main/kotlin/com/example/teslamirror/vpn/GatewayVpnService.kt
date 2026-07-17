@@ -12,43 +12,49 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.example.teslamirror.MainActivity
 import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 테슬라 브라우저 LAN 격리 우회 — "가짜 공인 IP 소유"만 담당 (Tesor/TeslaMirror 방식).
+ * 테슬라 브라우저 LAN 격리 우회 게이트웨이 (Tesor 방식) — tun 릴레이.
  *
- * 배경(memory: teslamirror-tesla-browser-lan-isolation):
- * 테슬라 브라우저는 사설 IP(10.x/172.16-31.x/192.168.x) 목적지로는 접속/UDP를 아예 막는다.
- * 그래서 뷰어에게는 **공인처럼 보이는 IP**([FAKE_IP])를 후보로 광고해야 한다.
+ * 배경/실측(memory: teslamirror-tesla-browser-lan-isolation):
+ * 테슬라 브라우저는 사설 IP로는 UDP를 안 보낸다. 그래서 뷰어에겐 가짜 공인 IP([FAKE_IP])를
+ * 후보로 광고한다(WebRtcSession이 offer의 사설 후보를 FAKE_IP로 재작성, 포트 유지).
  *
- * 핵심 메커니즘(조사 확인): 비루트 안드로이드에서 **테더링 클라이언트(차)가 포워딩한 패킷은
- * 앱 VpnService의 tun으로 안 들어온다**(PCAPdroid/VPNHotspot 근거 — 그래서 그들은 루트 필요).
- * 대신 이 서비스는 **[FAKE_IP]를 tun의 로컬 주소로 addAddress**해서 폰이 그 IP를 "소유"한다.
- * 그러면 차가 [FAKE_IP]로 보낸 패킷은 *포워딩이 아니라 로컬 배달(INPUT)*되어, 그 주소에
- * 바인딩된 폰의 소켓(libwebrtc host 후보 소켓)이 직접 받는다. 셀룰러로 안 나가고 로컬 종결.
- *
- * 따라서 이 서비스는 라우팅/릴레이/패킷파싱을 하지 않는다. IP 하나만 소유하고 tun을 열어둔다.
- * WebRtcSession은 disableNetworkMonitor로 tun의 [FAKE_IP]까지 열거해 그 위에 host 후보를
- * 만들고(=그 주소에 소켓 바인딩), offer에 [FAKE_IP] 후보를 남겨 광고한다.
- *
- * ⚠️ 미검증(조사상 "Likely"): 위 로컬-배달 경로가 실기기에서 성립하는지 + libwebrtc가 tun
- * 인터페이스에 host 후보를 만드는지는 실차/실기기 확인 필요. 안 되면 대안은 FAKE_IP에
- * 직접 바인딩한 유저스페이스 UDP 릴레이(이 서비스가 소유한 IP:포트 ↔ libwebrtc 실제 포트).
+ * 폰이 차의 게이트웨이(핫스팟)이고 이 서비스가 [FAKE_IP]를 addAddress+addRoute로 tun에
+ * 소유하므로, 차가 [FAKE_IP]:P로 보낸 WebRTC UDP는 **tun fd로 들어온다(실차 실측 2026-07-17:
+ * "tun ingress" 확인)**. 여기서 그 패킷을 폰의 실제 libwebrtc 포트(핫스팟IP:P — 재작성이 포트를
+ * 보존하므로 목적지 포트 P가 그대로 libwebrtc의 사설 후보 포트)로 릴레이하고, libwebrtc의
+ * 응답을 src=[FAKE_IP]:P로 다시 IPv4/UDP로 감싸 tun에 써 넣는다. 차 NAT가 브라우저로 되돌린다.
+ * 경로는 전부 로컬(핫스팟) → 저지연.
  */
 class GatewayVpnService : VpnService() {
 
     @Volatile private var tun: ParcelFileDescriptor? = null
     @Volatile private var running = false
-    private var drainThread: Thread? = null
+    private var pumpThread: Thread? = null
+
+    private val relays = ConcurrentHashMap<String, RelaySocket>()
+    private val fakeIpInt = Ipv4Udp.ipFromString(FAKE_IP)
+    // libwebrtc host 후보가 바인딩된 폰 로컬 주소(swlan0 IPv4). 재작성이 포트를 보존하므로
+    // 릴레이는 (apAddr, tun에서 본 dstPort)로 전달하면 libwebrtc 사설 후보 소켓에 도달한다.
+    @Volatile private var apAddr: InetAddress = InetAddress.getByName("127.0.0.1")
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
         if (running) return START_STICKY
         startForegroundNotif()
+        apAddr = resolveApAddress() ?: InetAddress.getByName("127.0.0.1")
         if (!establish()) { stopSelf(); return START_NOT_STICKY }
         running = true
-        // tun에는 아무것도 안 들어오는 게 정상(로컬 배달됨). 만일을 대비해 읽어 버려 백업 방지.
-        drainThread = Thread({ drain() }, "GatewayVpnDrain").also { it.start() }
-        Log.i(TAG, "started; owning $FAKE_IP as local address")
+        pumpThread = Thread({ pump() }, "GatewayVpnPump").also { it.start() }
+        Log.i(TAG, "started; $FAKE_IP → relay to ${apAddr.hostAddress}:<dstPort>")
         return START_STICKY
     }
 
@@ -56,8 +62,8 @@ class GatewayVpnService : VpnService() {
         tun = Builder()
             .setSession("TeslaMirror")
             .setMtu(MTU)
-            .addAddress(FAKE_IP, 32)     // ★ 이 IP를 폰 로컬 주소로 소유 → 차 패킷이 로컬 배달됨
-            .addRoute(FAKE_IP, 32)       // Builder 최소 라우트 요건 충족(출력용, 무해)
+            .addAddress(FAKE_IP, 32)     // 폰이 IP 소유
+            .addRoute(FAKE_IP, 32)       // → 차의 FAKE_IP 패킷을 tun으로
             .setBlocking(true)
             .establish()
         tun != null
@@ -65,27 +71,87 @@ class GatewayVpnService : VpnService() {
         Log.e(TAG, "establish failed", t); false
     }
 
-    private fun drain() {
+    /** tun 읽기 루프: 차 → FAKE_IP:P UDP를 로컬 libwebrtc(apAddr:P)로 릴레이. */
+    private fun pump() {
         val fd = tun ?: return
         val input = FileInputStream(fd.fileDescriptor)
+        val output = FileOutputStream(fd.fileDescriptor)
         val buf = ByteArray(MTU)
+        var rx = 0L
         while (running) {
-            val n = try { input.read(buf) } catch (_: Throwable) { break }
+            val n = try { input.read(buf) } catch (t: Throwable) { if (running) Log.w(TAG, "tun read", t); break }
             if (n <= 0) continue
-            // 여기 도달하면 로컬-배달 가정이 깨진 것(패킷이 tun으로 옴). 진단용 로그.
-            Log.w(TAG, "unexpected tun ingress ${n}B — local-delivery assumption may not hold")
+            val dg = Ipv4Udp.parse(buf, n) ?: continue
+            if (dg.dstIp != fakeIpInt) continue
+            rx++
+            if (rx <= 3 || rx % 300 == 0L) {
+                Log.i(TAG, "rx #$rx ${Ipv4Udp.ipToString(dg.srcIp)}:${dg.srcPort} → $FAKE_IP:${dg.dstPort} (${dg.payload.size}B)")
+            }
+            val key = "${dg.srcIp}:${dg.srcPort}:${dg.dstPort}"
+            val relay = relays.getOrPut(key) {
+                RelaySocket(dg.srcIp, dg.srcPort, dg.dstPort, output).also { it.start() }
+            }
+            relay.sendToLocal(dg.payload)
         }
+        Log.i(TAG, "pump ended rx=$rx")
+    }
+
+    /**
+     * 하나의 (차 소스 + 목적포트)에 대응하는 릴레이. 차→libwebrtc는 sendToLocal,
+     * libwebrtc→차는 리더 스레드가 tun에 src=FAKE_IP:dstPort로 재주입.
+     */
+    private inner class RelaySocket(
+        private val carIp: Int,
+        private val carPort: Int,
+        private val dstPort: Int,          // = libwebrtc 사설 후보 포트(포트 보존 재작성 덕분)
+        private val tunOut: FileOutputStream,
+    ) {
+        private val sock = DatagramSocket().also { protect(it) }   // VPN 우회(로컬 전송)
+        private val rbuf = ByteArray(MTU)
+        @Volatile private var alive = true
+        private val target = InetSocketAddress(apAddr, dstPort)
+
+        fun start() {
+            Thread({
+                while (alive && running) {
+                    val p = DatagramPacket(rbuf, rbuf.size)
+                    try { sock.receive(p) } catch (_: Throwable) { break }
+                    val payload = ByteArray(p.length)
+                    System.arraycopy(rbuf, 0, payload, 0, p.length)
+                    val pkt = Ipv4Udp.build(fakeIpInt, dstPort, carIp, carPort, payload)
+                    synchronized(tunOut) { runCatching { tunOut.write(pkt) } }
+                }
+            }, "Relay-$dstPort").start()
+        }
+
+        fun sendToLocal(payload: ByteArray) {
+            runCatching { sock.send(DatagramPacket(payload, payload.size, target)) }
+        }
+
+        fun close() { alive = false; runCatching { sock.close() } }
     }
 
     override fun onDestroy() {
         running = false
+        relays.values.forEach { it.close() }; relays.clear()
         runCatching { tun?.close() }; tun = null
-        runCatching { drainThread?.interrupt() }
+        runCatching { pumpThread?.interrupt() }
         Log.i(TAG, "destroyed")
         super.onDestroy()
     }
 
     override fun onRevoke() { stopSelf(); super.onRevoke() }
+
+    private fun resolveApAddress(): InetAddress? = try {
+        NetworkInterface.getNetworkInterfaces().toList()
+            .filter { it.isUp && !it.isLoopback }
+            .filter { ni ->
+                val n = ni.name.lowercase()
+                n.startsWith("ap") || n.startsWith("softap") || n.startsWith("swlan") || n == "wlan1"
+            }
+            .flatMap { it.inetAddresses.toList() }
+            .firstOrNull { !it.isLinkLocalAddress && it.hostAddress?.contains(':') == false }
+    } catch (_: Throwable) { null }
 
     private fun startForegroundNotif() {
         val nm = getSystemService(NotificationManager::class.java)
@@ -112,9 +178,7 @@ class GatewayVpnService : VpnService() {
         private const val TAG = "GatewayVpn"
         const val ACTION_STOP = "com.example.teslamirror.vpn.STOP"
 
-        // 뷰어에게 광고할 가짜 공인 IP(TEST-NET-3, RFC5737 — 실인터넷에 없는 문서용 대역).
-        // 사설 IP가 아니므로 테슬라 브라우저 필터를 통과하고, addAddress로 폰이 소유하므로
-        // 차가 이 IP로 보낸 패킷은 로컬 배달된다.
+        // 뷰어에 광고할 가짜 공인 IP(TEST-NET-3, RFC5737). 사설 IP가 아니라 테슬라 필터 통과.
         const val FAKE_IP = "203.0.113.7"
         private const val MTU = 1500
         private const val CHANNEL = "teslamirror_vpn"
