@@ -54,16 +54,51 @@ class GatewayVpnService : VpnService() {
         if (!establish()) { stopSelf(); return START_NOT_STICKY }
         running = true
         pumpThread = Thread({ pump() }, "GatewayVpnPump").also { it.start() }
+        startProbeSocket()   // [진단] FAKE_IP:9999에 실소켓 바인딩 — 로컬배달 여부 판정
         Log.i(TAG, "started; $FAKE_IP → relay to ${apAddr.hostAddress}:<dstPort>")
         return START_STICKY
+    }
+
+    /**
+     * [결정 실험] FAKE_IP:9999에 UDP 소켓을 바인딩하고 수신을 로그.
+     * PC(핫스팟 클라이언트=차와 동일 경로)에서 203.0.113.7:9999로 프로브를 쏴서:
+     *  - "PROBE RECV" 로그 → addAddress 로컬배달 성립 → VpnService 게이트웨이 방식 유효.
+     *  - pump의 "rx" 로그 → 소켓 대신 tun으로 감(포트별 처리 차이).
+     *  - 둘 다 없음 → 포워딩 패킷이 앱에 안 옴 → 이 방식 폐기 판정.
+     */
+    private fun startProbeSocket() {
+        // 두 소켓으로 동시 판정: (A) 0.0.0.0:9999 no-protect, (B) FAKE_IP:9998 no-protect.
+        for ((tag, bindAddr, port) in listOf(
+            Triple("A-wildcard", "0.0.0.0", 9999),
+            Triple("B-fakeip", FAKE_IP, 9998),
+        )) {
+            Thread({
+                try {
+                    val s = DatagramSocket(null)
+                    s.reuseAddress = true
+                    s.bind(InetSocketAddress(InetAddress.getByName(bindAddr), port))
+                    Log.i(TAG, "PROBE[$tag] bound $bindAddr:$port")
+                    val b = ByteArray(2048)
+                    while (running) {
+                        val p = DatagramPacket(b, b.size)
+                        s.receive(p)
+                        Log.i(TAG, "PROBE RECV[$tag] ${p.length}B from ${p.address.hostAddress}:${p.port} → local delivery WORKS")
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "PROBE[$tag] error: ${t.message}")
+                }
+            }, "GatewayVpnProbe-$tag").start()
+        }
     }
 
     private fun establish(): Boolean = try {
         tun = Builder()
             .setSession("TeslaMirror")
             .setMtu(MTU)
-            .addAddress(FAKE_IP, 32)     // 폰이 IP 소유
-            .addRoute(FAKE_IP, 32)       // → 차의 FAKE_IP 패킷을 tun으로
+            // ★ 실험: FAKE_IP를 소유(addAddress)하지 않고 라우트만 건다. 그러면 클라이언트가
+            // FAKE_IP로 보낸 패킷은 로컬 INPUT이 아니라 '포워딩' 대상 → 라우트 따라 tun으로.
+            .addAddress(TUN_ADDR, 32)    // tun 자체 주소(더미). FAKE_IP는 소유 안 함.
+            .addRoute(FAKE_IP, 32)       // → 차의 FAKE_IP 패킷을 포워딩→tun으로
             .setBlocking(true)
             .establish()
         tun != null
@@ -180,6 +215,7 @@ class GatewayVpnService : VpnService() {
 
         // 뷰어에 광고할 가짜 공인 IP(TEST-NET-3, RFC5737). 사설 IP가 아니라 테슬라 필터 통과.
         const val FAKE_IP = "203.0.113.7"
+        private const val TUN_ADDR = "10.99.99.2"   // tun 더미 주소(FAKE_IP는 소유 안 함)
         private const val MTU = 1500
         private const val CHANNEL = "teslamirror_vpn"
         private const val NOTIF_ID = 42
