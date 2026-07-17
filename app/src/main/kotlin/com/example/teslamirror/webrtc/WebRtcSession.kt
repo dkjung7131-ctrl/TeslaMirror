@@ -84,7 +84,8 @@ class WebRtcSession(
         runCatching { projection?.stop() }
         capturer = null; virtualDisplay = null; projection = null
         scope.cancel()                       // negotiateLoop 종료
-        runCatching { factory.dispose() }    // PC 정리 후 팩토리 해제
+        // factory.dispose() 금지 — closeConnection과 같은 SIGILL 계열 위험(네이티브 해제).
+        // v0.5.2까지 해제 없이 안정 동작 확인. 세션 종료 후 프로세스가 놀면 OS가 회수한다.
     }
 
     private fun initFactory() {
@@ -268,8 +269,12 @@ class WebRtcSession(
     }
 
     private fun closeConnection() {
-        runCatching { dataChannel?.dispose() }
-        runCatching { pc?.dispose() }
+        // dispose()는 금지: 이 조합(stream-webrtc 1.3.8 + Galaxy S936N/Android 16)에서
+        // nativeFreeOwnedPeerConnection SIGILL로 앱이 통째로 죽는다(2026-07-17 실측 3회 —
+        // 뷰어가 끊겨 재협상하는 순간 사망 → 테슬라가 영원히 "연결중"에 갇히는 원인).
+        // close()만 하고 네이티브 해제는 GC에 맡긴다. 재연결당 소량 누수 < 크래시.
+        runCatching { dataChannel?.close() }
+        runCatching { pc?.close() }
         dataChannel = null; pc = null
     }
 
