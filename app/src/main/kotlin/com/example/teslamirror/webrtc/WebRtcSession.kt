@@ -51,6 +51,10 @@ class WebRtcSession(
     private val fps: Int,
     private val onStatus: (String) -> Unit,
     private val onProjectionLost: () -> Unit,
+    // 널이 아니면 VPN 게이트웨이 모드: 이 가짜 공인 IP(GatewayVpnService가 addAddress로 소유)
+    // 후보를 offer에 남겨 테슬라에 광고한다. libwebrtc가 tun의 이 주소에 host 후보를 만들면
+    // 차가 그 IP로 보낸 UDP가 로컬 배달돼 연결된다. 널이면 사설 IPv4 후보만(기존 동작).
+    private val advertiseIp: String? = null,
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private lateinit var factory: PeerConnectionFactory
@@ -97,6 +101,13 @@ class WebRtcSession(
         // disableNetworkMonitor로 네이티브 열거를 써야 로컬 후보(핫스팟 IP)가 잡힌다.
         val options = PeerConnectionFactory.Options().apply { disableNetworkMonitor = true }
         factory = PeerConnectionFactory.builder().setOptions(options).createPeerConnectionFactory()
+        // VPN 게이트웨이 모드는 미검증이라, 실차 진단용으로 libwebrtc ICE 로그를 켠다
+        // (connection.cc의 STUN 송수신 확인 → 연결 실패 원인 즉시 파악). 검증 후 낮춰도 됨.
+        if (advertiseIp != null) {
+            runCatching {
+                org.webrtc.Logging.enableLogToDebugOutput(org.webrtc.Logging.Severity.LS_INFO)
+            }
+        }
     }
 
     private fun startCapture() {
@@ -211,23 +222,33 @@ class WebRtcSession(
         withTimeoutOrNull(5000) { gathered.await() }   // 이벤트가 먼저 왔어도 즉시 반환
         val raw = pc!!.localDescription?.description ?: offer.description
         val filtered = filterToLocalCandidates(raw)
-        // 사설 IPv4 후보가 하나도 없으면(핫스팟 특이/타임아웃) 원본으로 폴백 — 로컬을 못 쓰면
-        // 지연은 나빠도 '연결은 되게' 한다. 정상 케이스는 항상 로컬 후보가 남는다.
+        // 쓸 후보(사설 IPv4 + VPN 모드면 FAKE_IP)가 하나도 없으면 원본으로 폴백.
         val hasLocal = Regex("""a=candidate:""").containsMatchIn(filtered)
         if (!hasLocal) {
-            Log.w(TAG, "no local candidate after filter — falling back to raw SDP")
+            Log.w(TAG, "no usable candidate after filter — falling back to raw SDP")
             onStatus("로컬 네트워크 후보 없음 — 핫스팟 확인 (지연 가능)")
         }
         val sdp = if (hasLocal) filtered else raw
-        Log.i(TAG, "offer ready localCandidates=${Regex("""a=candidate:""").findAll(filtered).count()}")
+        // VPN 모드 진단: libwebrtc가 tun의 FAKE_IP에 host 후보를 만들었는지가 성패를 가른다.
+        val hasFake = advertiseIp != null && sdp.contains(" $advertiseIp ")
+        Log.i(TAG, "offer ready cands=${Regex("""a=candidate:""").findAll(sdp).count()} vpn=$advertiseIp fakeCandPresent=$hasFake")
+        if (advertiseIp != null && !hasFake) {
+            Log.w(TAG, "VPN mode but no $advertiseIp candidate — libwebrtc가 tun을 열거 못함(대안: 유저스페이스 릴레이 필요)")
+        }
         return sdp
     }
 
+    /**
+     * 뷰어에게 광고할 후보만 남긴다.
+     * - 기본: 사설 IPv4(로컬 핫스팟 경로) 후보만 → 셀룰러 왕복 방지.
+     * - VPN 모드([advertiseIp]≠null): 사설 IPv4 + FAKE_IP 후보 유지. 테슬라는 사설 IP를
+     *   무시하고 FAKE_IP로만 접속(=로컬 소유 주소로 배달), 핫스팟에 붙은 PC 뷰어는 사설 IP로 접속.
+     */
     private fun filterToLocalCandidates(sdp: String): String {
         val out = sdp.split("\r\n", "\n").map { it.trimEnd('\r') }.filter { line ->
             if (!line.startsWith("a=candidate:")) return@filter true
             val addr = line.removePrefix("a=").split(' ').getOrNull(4) ?: return@filter false
-            isPrivateIpv4(addr)
+            isPrivateIpv4(addr) || addr == advertiseIp
         }
         return out.joinToString("\r\n").trimEnd() + "\r\n"
     }

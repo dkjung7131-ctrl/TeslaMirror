@@ -39,6 +39,7 @@ class ScreenCaptureService : Service() {
         private const val EXTRA_RESULT_CODE = "result_code"
         private const val EXTRA_DATA = "data"
         private const val EXTRA_FPS = "fps"
+        private const val EXTRA_USE_VPN = "use_vpn"
         private const val ACTION_STOP = "stop"
 
         private const val AUTO_STOP_MS = 6 * 60 * 60 * 1000L  // 6시간
@@ -59,11 +60,12 @@ class ScreenCaptureService : Service() {
         private val _statusFlow = MutableStateFlow("")
         val statusFlow: StateFlow<String> = _statusFlow.asStateFlow()
 
-        fun start(context: Context, resultCode: Int, data: Intent, fps: Int) {
+        fun start(context: Context, resultCode: Int, data: Intent, fps: Int, useVpn: Boolean = false) {
             val i = Intent(context, ScreenCaptureService::class.java).apply {
                 putExtra(EXTRA_RESULT_CODE, resultCode)
                 putExtra(EXTRA_DATA, data)
                 putExtra(EXTRA_FPS, fps)
+                putExtra(EXTRA_USE_VPN, useVpn)
             }
             context.startForegroundService(i)
         }
@@ -142,6 +144,7 @@ class ScreenCaptureService : Service() {
             @Suppress("DEPRECATION") intent?.getParcelableExtra(EXTRA_DATA)
 
         val fps = intent?.getIntExtra(EXTRA_FPS, 30) ?: 30
+        val useVpn = intent?.getBooleanExtra(EXTRA_USE_VPN, false) ?: false
 
         if (resultCode != Activity.RESULT_OK || data == null) {
             Log.e(TAG, "Invalid projection grant")
@@ -153,7 +156,7 @@ class ScreenCaptureService : Service() {
             if (scope.coroutineContext[kotlinx.coroutines.Job]?.isActive != true) {
                 scope = CoroutineScope(Dispatchers.Default + SupervisorJob())  // 재시작 대비 재생성
             }
-            startProjection(resultCode, data, fps)
+            startProjection(resultCode, data, fps, useVpn)
             _isRunningFlow.value = true
             mainHandler.postDelayed(autoStopRunnable, AUTO_STOP_MS)
             consecutiveNetFailures = 0
@@ -168,13 +171,16 @@ class ScreenCaptureService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startProjection(resultCode: Int, data: Intent, fps: Int) {
+    private fun startProjection(resultCode: Int, data: Intent, fps: Int, useVpn: Boolean) {
         // 테슬라 브라우저는 사설 IP 직접 접속을 막으므로 MJPEG(로컬 서버) 대신
         // WebRTC로 공개 페이지를 거쳐 로컬 P2P 연결한다. 시그널링에 접선 서버 시크릿 필요.
         if (!RendezvousUpdater.isConfigured(this)) {
             Log.w(TAG, "rendezvous secret not set — WebRTC signaling unavailable")
             throw IllegalStateException("공용 접속 주소 시크릿을 먼저 저장하세요")
         }
+        // VPN 모드: offer 후보를 가짜 공인 IP로 광고해 테슬라 LAN 격리를 우회한다.
+        // (VpnService는 MainActivity에서 미리 기동/권한 승인됨)
+        val advertiseIp = if (useVpn) com.example.teslamirror.vpn.GatewayVpnService.FAKE_IP else null
         val (w, h, _) = displayParams()
         val (capW, capH) = scaleTo720p(w, h)
         webRtcSession = WebRtcSession(
@@ -186,6 +192,7 @@ class ScreenCaptureService : Service() {
             fps = fps,
             onStatus = { _statusFlow.value = it },
             onProjectionLost = { stopEverything(); stopSelf() },
+            advertiseIp = advertiseIp,
         ).also { it.start() }
     }
 
