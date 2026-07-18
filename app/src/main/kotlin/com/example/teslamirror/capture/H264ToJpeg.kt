@@ -4,8 +4,8 @@ import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.media.Image
-import android.media.ImageReader
 import android.media.MediaCodec
+import android.media.MediaCodecInfo.CodecCapabilities
 import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
@@ -14,14 +14,16 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 
 /**
- * scrcpy가 주는 H.264(Annex-B) 스트림을 디코드해 JPEG로 변환한다.
- * 앱 모드 뷰어(테슬라 브라우저)는 전체화면과 동일한 **JPEG 데이터채널** 뷰어라,
- * H.264를 그대로 못 그리므로 폰에서 디코드→JPEG 재인코딩한다(WebCodecs 미지원 회피).
+ * scrcpy가 주는 H.264(Annex-B) 스트림을 디코드해 JPEG로 변환한다(앱 모드 전송용).
+ * 앱 모드 뷰어(테슬라 브라우저)는 전체화면과 동일한 **JPEG 데이터채널** 뷰어라 H.264를 그대로
+ * 못 그리므로 폰에서 디코드→JPEG 재인코딩한다.
  *
- * 경로: MediaCodec(video/avc) → ImageReader(YUV_420_888) → NV21 → YuvImage.compressToJpeg.
- * [shouldEncode]가 false면 디코더 출력은 비우되 JPEG 인코딩/전송은 건너뛴다(뷰어 없음/백프레셔).
+ * ⚠️ **ByteBuffer(Surface 없음) 디코드**를 쓴다. Surface(ImageReader) 출력은 이 기기(S936N)에서
+ * GPU 전용 버퍼라 planes를 CPU로 못 읽고 SIGSEGV/JNI-abort 실측. 코덱 소유 출력 버퍼는 CPU
+ * 접근 가능하므로 `getOutputImage`로 YUV_420_888을 받아 NV21→YuvImage.compressToJpeg 한다.
  *
- * config(SPS/PPS) 패킷을 먼저 [submitConfig]로 준 뒤 프레임을 [submitFrame]으로 넣는다.
+ * config(SPS/PPS)는 [submitConfig], 프레임은 [submitFrame]. 별도 config 없으면 키프레임 인라인
+ * SPS/PPS로 시작. [shouldEncode]가 false면 lastJpeg 캐시만 하고 전송은 건너뛴다.
  */
 class H264ToJpeg(
     private val width: Int,
@@ -31,17 +33,14 @@ class H264ToJpeg(
     private val onJpeg: (ByteArray) -> Unit,
 ) {
     private var codec: MediaCodec? = null
-    private var reader: ImageReader? = null
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
     @Volatile private var started = false
     @Volatile private var configData: ByteArray? = null
     private val baos = ByteArrayOutputStream(128 * 1024)
 
-    /** 별도 config 패킷이 오는 경우(csd-0 지정). 없으면 submitFrame이 csd 없이 시작한다. */
     fun submitConfig(config: ByteArray) = ensureStarted(config)
 
-    /** 디코더 구성·기동. [csd]가 null이면 csd-0 없이 시작(키프레임 인라인 SPS/PPS 사용). */
     @Synchronized
     private fun ensureStarted(csd: ByteArray?) {
         if (csd != null) configData = csd
@@ -51,25 +50,8 @@ class H264ToJpeg(
             thread = t
             handler = Handler(t.looper)
 
-            val r = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 3)
-            r.setOnImageAvailableListener({ ir ->
-                val img = try { ir.acquireLatestImage() } catch (_: Throwable) { null } ?: return@setOnImageAvailableListener
-                try {
-                    imgCount++
-                    if (imgCount <= 3 || imgCount % 120 == 0L) Log.i(TAG, "img#$imgCount ${img.width}x${img.height}")
-                    // 항상 JPEG로 만들어 lastJpeg에 캐시(늦게 붙은 뷰어가 정적 화면에서도 즉시 볼 수
-                    // 있게). 데이터채널 전송은 canSend일 때만(재전송 루프가 담당).
-                    encodeAndCache(img)
-                } catch (t: Throwable) {
-                    Log.w(TAG, "encode failed", t)
-                } finally {
-                    img.close()
-                }
-            }, handler)
-            reader = r
-
             val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-                // config 패킷이 있으면 csd-0 지정, 없으면 생략(디코더가 스트림 인라인 SPS/PPS로 구성).
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, CodecCapabilities.COLOR_FormatYUV420Flexible)
                 configData?.let { setByteBuffer("csd-0", ByteBuffer.wrap(it)) }
             }
             val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -79,26 +61,34 @@ class H264ToJpeg(
                     drainInput(mc)
                 }
                 override fun onOutputBufferAvailable(mc: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
-                    // ImageReader surface로 렌더 → onImageAvailable에서 처리
-                    runCatching { mc.releaseOutputBuffer(index, true) }
+                    try {
+                        val img = mc.getOutputImage(index)   // ByteBuffer 모드 → CPU 접근 가능
+                        if (img != null) {
+                            imgCount++
+                            if (imgCount <= 3 || imgCount % 120 == 0L) Log.i(TAG, "img#$imgCount ${img.width}x${img.height}")
+                            runCatching { encodeAndCache(img) }.onFailure { Log.w(TAG, "encode", it) }
+                            img.close()
+                        }
+                    } finally {
+                        runCatching { mc.releaseOutputBuffer(index, false) }
+                    }
                 }
                 override fun onError(mc: MediaCodec, e: MediaCodec.CodecException) {
                     Log.w(TAG, "codec error: ${e.message}")
                 }
                 override fun onOutputFormatChanged(mc: MediaCodec, format: MediaFormat) {}
             }, handler)
-            c.configure(fmt, r.surface, null, 0)
+            c.configure(fmt, null, null, 0)   // Surface 없음 = ByteBuffer 모드
             c.start()
             codec = c
             started = true
             startReemitLoop()
-            Log.i(TAG, "decoder started ${width}x$height")
+            Log.i(TAG, "decoder started ${width}x$height (ByteBuffer)")
         } catch (t: Throwable) {
             Log.e(TAG, "decoder init failed", t)
         }
     }
 
-    /** H.264 프레임(Annex-B, key/delta) 투입. 미기동이면 csd 없이 시작(인라인 SPS/PPS). */
     fun submitFrame(frame: ByteArray, isKey: Boolean) {
         if (!started) ensureStarted(null)
         if (!started) return
@@ -106,7 +96,6 @@ class H264ToJpeg(
         codec?.let { drainInput(it) }
     }
 
-    // MediaCodec 비동기: 사용 가능한 입력 버퍼 인덱스 ↔ 대기 프레임을 매칭.
     private val inputQueue = ArrayDeque<Int>()
     private val pendingFrames = ArrayDeque<Pair<ByteArray, Boolean>>()
 
@@ -117,8 +106,7 @@ class H264ToJpeg(
             val (frame, _) = pendingFrames.removeFirst()
             try {
                 val buf = mc.getInputBuffer(index) ?: continue
-                buf.clear()
-                buf.put(frame)
+                buf.clear(); buf.put(frame)
                 mc.queueInputBuffer(index, 0, frame.size, System.nanoTime() / 1000, 0)
             } catch (t: Throwable) {
                 Log.w(TAG, "queueInput failed", t)
@@ -131,27 +119,54 @@ class H264ToJpeg(
     @Volatile private var lastJpeg: ByteArray? = null
     @Volatile private var lastEmitMs = 0L
     private var reemitThread: Thread? = null
+    private var nv21: ByteArray? = null
 
+    /** YUV_420_888(CPU 버퍼) → NV21 → JPEG. lastJpeg 캐시 + canSend 시 전송. */
     private fun encodeAndCache(img: Image) {
-        val nv21 = yuv420ToNv21(img)
+        val w = img.width; val h = img.height
+        val out = nv21?.takeIf { it.size == w * h * 3 / 2 } ?: ByteArray(w * h * 3 / 2).also { nv21 = it }
+        yuv420ToNv21(img, out)
         baos.reset()
-        val yuv = YuvImage(nv21, ImageFormat.NV21, img.width, img.height, null)
-        yuv.compressToJpeg(Rect(0, 0, img.width, img.height), quality, baos)
+        YuvImage(out, ImageFormat.NV21, w, h, null).compressToJpeg(Rect(0, 0, w, h), quality, baos)
         val bytes = baos.toByteArray()
         jpegCount++
         if (jpegCount <= 3 || jpegCount % 120 == 0L) Log.i(TAG, "jpeg#$jpegCount ${bytes.size}B")
         lastJpeg = bytes
-        if (shouldEncode()) {                       // 뷰어 연결 + 버퍼 여유일 때만 전송
+        if (shouldEncode()) {
             lastEmitMs = System.currentTimeMillis()
             onJpeg(bytes)
         }
     }
 
-    /**
-     * 정적 화면 대비: H.264는 변화 없으면 프레임을 안 보내 디코더 출력이 멈춘다.
-     * 새 프레임이 없을 때 마지막 JPEG를 낮은 주기로 재전송해 뷰어가 항상 현재 화면을 갖게 한다.
-     * (내비처럼 계속 움직이면 이 경로는 거의 안 탄다.)
-     */
+    /** YUV_420_888(스트라이드/픽셀스트라이드 고려) → NV21(Y + 인터리브 VU). */
+    private fun yuv420ToNv21(image: Image, out: ByteArray) {
+        val w = image.width; val h = image.height
+        val yP = image.planes[0]; val uP = image.planes[1]; val vP = image.planes[2]
+        var pos = 0
+        val yBuf = yP.buffer; val yRow = yP.rowStride
+        val yRowTmp = ByteArray(yRow)
+        for (row in 0 until h) {
+            yBuf.position(row * yRow)
+            val n = minOf(yRow, yBuf.remaining())
+            yBuf.get(yRowTmp, 0, n)
+            System.arraycopy(yRowTmp, 0, out, pos, w)
+            pos += w
+        }
+        val uBuf = uP.buffer; val vBuf = vP.buffer
+        val uRow = uP.rowStride; val vRow = vP.rowStride
+        val uPix = uP.pixelStride; val vPix = vP.pixelStride
+        val cw = w / 2; val ch = h / 2
+        for (row in 0 until ch) {
+            var uIdx = row * uRow
+            var vIdx = row * vRow
+            for (col in 0 until cw) {
+                out[pos++] = vBuf.get(vIdx)
+                out[pos++] = uBuf.get(uIdx)
+                uIdx += uPix; vIdx += vPix
+            }
+        }
+    }
+
     private fun startReemitLoop() {
         reemitThread = Thread {
             while (started) {
@@ -171,47 +186,13 @@ class H264ToJpeg(
         runCatching { reemitThread?.interrupt() }; reemitThread = null
         runCatching { codec?.stop() }
         runCatching { codec?.release() }
-        runCatching { reader?.close() }
         runCatching { thread?.quitSafely() }
-        codec = null; reader = null; thread = null; handler = null
+        codec = null; thread = null; handler = null
         inputQueue.clear(); pendingFrames.clear()
-    }
-
-    /** YUV_420_888(스트라이드 고려) → NV21(Y plane + 인터리브 VU). */
-    private fun yuv420ToNv21(image: Image): ByteArray {
-        val w = image.width; val h = image.height
-        val out = ByteArray(w * h * 3 / 2)
-        val yP = image.planes[0]; val uP = image.planes[1]; val vP = image.planes[2]
-
-        // Y
-        var pos = 0
-        val yBuf = yP.buffer; val yRow = yP.rowStride
-        for (row in 0 until h) {
-            val start = row * yRow
-            yBuf.position(start)
-            yBuf.get(out, pos, w)
-            pos += w
-        }
-        // VU 인터리브 (NV21 = V,U 순)
-        val uBuf = uP.buffer; val vBuf = vP.buffer
-        val uRow = uP.rowStride; val vRow = vP.rowStride
-        val uPix = uP.pixelStride; val vPix = vP.pixelStride
-        val cw = w / 2; val ch = h / 2
-        for (row in 0 until ch) {
-            var uIdx = row * uRow
-            var vIdx = row * vRow
-            for (col in 0 until cw) {
-                out[pos++] = vBuf.get(vIdx)
-                out[pos++] = uBuf.get(uIdx)
-                uIdx += uPix
-                vIdx += vPix
-            }
-        }
-        return out
     }
 
     companion object {
         private const val TAG = "H264ToJpeg"
-        private const val REEMIT_INTERVAL_MS = 300L  // 정적 화면 시 마지막 프레임 재전송 주기(~3fps)
+        private const val REEMIT_INTERVAL_MS = 300L
     }
 }
