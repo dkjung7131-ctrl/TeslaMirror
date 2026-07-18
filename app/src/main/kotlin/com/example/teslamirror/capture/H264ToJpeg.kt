@@ -56,9 +56,10 @@ class H264ToJpeg(
                 val img = try { ir.acquireLatestImage() } catch (_: Throwable) { null } ?: return@setOnImageAvailableListener
                 try {
                     imgCount++
-                    val enc = shouldEncode()
-                    if (imgCount <= 3 || imgCount % 120 == 0L) Log.i(TAG, "img#$imgCount ${img.width}x${img.height} encode=$enc")
-                    if (enc) encodeAndEmit(img)
+                    if (imgCount <= 3 || imgCount % 120 == 0L) Log.i(TAG, "img#$imgCount ${img.width}x${img.height}")
+                    // 항상 JPEG로 만들어 lastJpeg에 캐시(늦게 붙은 뷰어가 정적 화면에서도 즉시 볼 수
+                    // 있게). 데이터채널 전송은 canSend일 때만(재전송 루프가 담당).
+                    encodeAndCache(img)
                 } catch (t: Throwable) {
                     Log.w(TAG, "encode failed", t)
                 } finally {
@@ -131,7 +132,7 @@ class H264ToJpeg(
     @Volatile private var lastEmitMs = 0L
     private var reemitThread: Thread? = null
 
-    private fun encodeAndEmit(img: Image) {
+    private fun encodeAndCache(img: Image) {
         val nv21 = yuv420ToNv21(img)
         baos.reset()
         val yuv = YuvImage(nv21, ImageFormat.NV21, img.width, img.height, null)
@@ -140,8 +141,10 @@ class H264ToJpeg(
         jpegCount++
         if (jpegCount <= 3 || jpegCount % 120 == 0L) Log.i(TAG, "jpeg#$jpegCount ${bytes.size}B")
         lastJpeg = bytes
-        lastEmitMs = System.currentTimeMillis()
-        onJpeg(bytes)
+        if (shouldEncode()) {                       // 뷰어 연결 + 버퍼 여유일 때만 전송
+            lastEmitMs = System.currentTimeMillis()
+            onJpeg(bytes)
+        }
     }
 
     /**
