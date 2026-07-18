@@ -53,32 +53,44 @@ class ScrcpyController(
         val jar = context.assets.open(ASSET_NAME).use { it.readBytes() }
         adb.pushFile(jar, REMOTE_JAR)
 
-        // 2) 서버 구동
+        // 2) 서버 구동 — 앱 실행까지 **같은 셸 안에서** 처리한다.
+        //    libadb는 scrcpy 서버 shell 스트림과 동시에 다른 명령 스트림(shell/exec)을
+        //    못 연다("Stream closed"/행). 그래서 별도 am start 스트림 대신, 서버 출력을
+        //    파이프로 읽어 "New display: id=N"을 잡고 같은 셸에서 am start 한다(추가 스트림 0).
         val scid = String.format(Locale.US, "%08x", Random.nextInt(1, Int.MAX_VALUE))
         val socketName = "localabstract:scrcpy_$scid"
-        val cmd = buildString {
-            append("CLASSPATH=$REMOTE_JAR app_process / com.genymobile.scrcpy.Server $SERVER_VERSION")
-            append(" scid=$scid log_level=info tunnel_forward=true")
-            append(" audio=false control=true video=true")
-            append(" new_display=${displayWidth}x${displayHeight}/$dpi")
-            append(" video_codec=h264 max_fps=$maxFps")
-        }
+        val server = "CLASSPATH=$REMOTE_JAR app_process / com.genymobile.scrcpy.Server $SERVER_VERSION" +
+            " scid=$scid log_level=info tunnel_forward=true audio=false control=true video=true" +
+            " new_display=${displayWidth}x${displayHeight}/$dpi video_codec=h264 max_fps=$maxFps"
+        // comp: 대상 앱의 launcher 액티비티(패키지/컴포넌트). 서버 시작 전에 한 번 조회.
+        val cmd = "comp=\$(cmd package resolve-activity --brief $targetPackage 2>/dev/null | tail -1); " +
+            "echo \"COMP=\$comp\"; " +
+            // 비대응(resizeableActivity=false) 앱도 가상 디스플레이에 뜨게 강제(am start --display가
+            // 앱을 본화면으로 튕기는 문제 해결). 전역 설정이라 1회면 유지.
+            "settings put global force_resizable_activities 1 2>/dev/null; " +
+            "settings put global enable_freeform_support 1 2>/dev/null; " +
+            "$server 2>&1 | while IFS= read -r line; do echo \"\$line\"; " +
+            "case \"\$line\" in *\"New display:\"*) " +
+            "id=\$(echo \"\$line\" | grep -o 'id=[0-9]*' | cut -d= -f2); " +
+            "pkg=\${comp%%/*}; am force-stop \"\$pkg\"; " +
+            "echo \"AMSTART[\$id,\$comp]:\$(am start --display \"\$id\" --activity-clear-task --activity-new-task -n \"\$comp\" 2>&1)\" ;; " +
+            "esac; done"
         serverStream = adb.openStream("shell:$cmd")
 
-        // 서버 로그 감시: New display id 파싱 → 앱 실행
+        // 서버 로그(파이프된 echo)를 읽어 진단 로그로 남긴다.
         logThread = Thread { readServerLog(adb, serverStream!!.openInputStream()) }.apply {
             isDaemon = true; start()
         }
 
-        // 3) 소켓 연결 (순서: 영상 → 컨트롤)
+        // 3) 영상 소켓 연결 + 파싱 (localabstract — 서버 shell과 공존 OK)
         videoStream = connectWithRetry(adb, socketName)
-        controlStream = connectWithRetry(adb, socketName)
-        controlOut = controlStream!!.openOutputStream()
-
-        // 5) 영상 파싱 루프
         videoThread = Thread { readVideo(videoStream!!.openInputStream()) }.apply {
             isDaemon = true; start()
         }
+
+        // 4) 컨트롤 소켓 연결(터치/키 역주입)
+        controlStream = connectWithRetry(adb, socketName)
+        controlOut = controlStream!!.openOutputStream()
     }
 
     fun sendControl(bytes: ByteArray) {
@@ -117,40 +129,27 @@ class ScrcpyController(
 
     private fun readServerLog(adb: AdbManager, input: InputStream) {
         try {
-            input.bufferedReader().forEachLine { line ->
-                Log.i(TAG, "[server] $line")
-                if (running && line.contains("New display:")) {
-                    val id = Regex("""id=(\d+)""").find(line)?.groupValues?.get(1)?.toIntOrNull()
-                    if (id != null) launchApp(adb, id)
-                }
-            }
+            input.bufferedReader().forEachLine { line -> Log.i(TAG, "[server] $line") }
         } catch (_: Throwable) { /* stream closed */ }
     }
 
-    private fun launchApp(adb: AdbManager, displayId: Int) {
-        try {
-            val resolved = adb.runCommand("cmd package resolve-activity --brief $targetPackage")
-                .trim().lines().map { it.trim() }.lastOrNull { it.contains("/") }
-            if (resolved.isNullOrBlank()) {
-                onError("앱 실행 실패: $targetPackage 액티비티를 찾을 수 없음")
-                return
-            }
-            adb.runCommand("am start --display $displayId -n $resolved")
-            Log.i(TAG, "launched $resolved on display $displayId")
-        } catch (t: Throwable) {
-            onError("앱 실행 실패: ${t.message}")
-        }
-    }
 
     private fun readVideo(input: InputStream) {
         try {
-            // 스트림 메타: dummy(1) + deviceName(64) + codecId(4)
+            // 스트림 메타(실측 덤프로 확정): dummy(1) + deviceName(64) + codecId(4)
+            //   + codecMeta(12: reserved4 + width4 + height4).
             skipFully(input, 1)
             skipFully(input, 64)
             val codec = ByteArray(4).also { readFully(input, it, 4) }
-            Log.i(TAG, "video codec=${String(codec, Charsets.US_ASCII)}")
+            val meta = ByteArray(12).also { readFully(input, it, 12) }
+            val w = ((meta[4].toInt() and 0xFF) shl 24) or ((meta[5].toInt() and 0xFF) shl 16) or
+                ((meta[6].toInt() and 0xFF) shl 8) or (meta[7].toInt() and 0xFF)
+            val h = ((meta[8].toInt() and 0xFF) shl 24) or ((meta[9].toInt() and 0xFF) shl 16) or
+                ((meta[10].toInt() and 0xFF) shl 8) or (meta[11].toInt() and 0xFF)
+            Log.i(TAG, "video codec=${String(codec, Charsets.US_ASCII)} ${w}x$h")
 
             val header = ByteArray(12)
+            var pktNo = 0
             while (running) {
                 readFully(input, header, 12)
                 val isConfig = (header[0].toInt() and 0x80) != 0
@@ -159,9 +158,17 @@ class ScrcpyController(
                     ((header[9].toInt() and 0xFF) shl 16) or
                     ((header[10].toInt() and 0xFF) shl 8) or
                     (header[11].toInt() and 0xFF)
-                if (size <= 0 || size > 20_000_000) throw IllegalStateException("bad packet size $size")
+                if (pktNo < 4) {
+                    Log.i(TAG, "PKT#$pktNo header=${header.joinToString(""){ "%02x".format(it) }} cfg=$isConfig key=$isKey size=$size")
+                }
+                if (size <= 0 || size > 20_000_000) throw IllegalStateException("bad packet size $size (pkt#$pktNo)")
                 val payload = ByteArray(size)
                 readFully(input, payload, size)
+                if (pktNo < 4) {
+                    val n = minOf(12, payload.size)
+                    Log.i(TAG, "PKT#$pktNo payload[0..$n]=${payload.copyOf(n).joinToString(""){ "%02x".format(it) }}")
+                }
+                pktNo++
                 if (isConfig) onConfig(payload) else onFrame(payload, isKey)
             }
         } catch (t: Throwable) {

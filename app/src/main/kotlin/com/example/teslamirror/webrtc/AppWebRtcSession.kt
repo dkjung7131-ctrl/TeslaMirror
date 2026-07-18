@@ -44,6 +44,9 @@ class AppWebRtcSession(
     private val onStatus: (String) -> Unit,
     // 뷰어가 데이터채널로 보낸 텍스트(JSON) — Phase 2 터치 역제어용. Phase 1은 무시 가능.
     private val onViewerMessage: (String) -> Unit = {},
+    // pc 연결 성립 시 1회 호출 — 새 뷰어가 디코드를 시작하려면 키프레임이 필요하므로
+    // scrcpy에 IDR을 요청하는 데 쓴다(정적 화면에서도 첫 프레임이 뜨게).
+    private val onConnected: () -> Unit = {},
     // 실차/테슬라 경로(STUN 공인 후보, 사설 제거). PC 핫스팟 로컬 디버그 시 false.
     private val internetPath: Boolean = true,
 ) {
@@ -113,6 +116,7 @@ class AppWebRtcSession(
                 val ok = withTimeoutOrNull(12_000) { connected.await() } != null
                 if (!ok) { Log.i(TAG, "not connected in 12s, re-offering"); closeConnection(); continue }
                 onStatus("연결됨")
+                runCatching { onConnected() }   // 새 뷰어용 키프레임 요청 등
                 awaitClosed()
             } catch (t: Throwable) {
                 if (running) Log.w(TAG, "negotiate error", t)

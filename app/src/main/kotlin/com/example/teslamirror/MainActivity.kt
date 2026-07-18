@@ -396,8 +396,10 @@ fun HomeScreen() {
                         when {
                             selectedPkg == null ->
                                 Toast.makeText(context, "앱을 선택하세요", Toast.LENGTH_SHORT).show()
-                            !isHotspotEnabled(context) ->
-                                Toast.makeText(context, "핫스팟을 먼저 켜주세요", Toast.LENGTH_LONG).show()
+                            // 앱 모드는 인터넷 ICE(STUN) 경로라 핫스팟이 필수는 아니다.
+                            // (내장 ADB/scrcpy는 무선 디버깅 mDNS를 쓰므로 Wi-Fi/네트워크만 있으면 됨.)
+                            !RendezvousUpdater.isConfigured(context) ->
+                                Toast.makeText(context, "공용 접속 주소 시크릿을 먼저 저장하세요", Toast.LENGTH_LONG).show()
                             else -> {
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                                     ContextCompat.checkSelfPermission(
@@ -406,7 +408,7 @@ fun HomeScreen() {
                                 ) {
                                     notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 }
-                                AppCastService.start(context, selectedPkg!!)
+                                AppCastService.start(context, selectedPkg!!, internetPath)
                             }
                         }
                     },

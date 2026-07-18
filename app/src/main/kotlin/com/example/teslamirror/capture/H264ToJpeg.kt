@@ -38,10 +38,13 @@ class H264ToJpeg(
     @Volatile private var configData: ByteArray? = null
     private val baos = ByteArrayOutputStream(128 * 1024)
 
-    /** 첫 config(SPS/PPS Annex-B) 수신 시 디코더 구성·기동. */
+    /** 별도 config 패킷이 오는 경우(csd-0 지정). 없으면 submitFrame이 csd 없이 시작한다. */
+    fun submitConfig(config: ByteArray) = ensureStarted(config)
+
+    /** 디코더 구성·기동. [csd]가 null이면 csd-0 없이 시작(키프레임 인라인 SPS/PPS 사용). */
     @Synchronized
-    fun submitConfig(config: ByteArray) {
-        configData = config
+    private fun ensureStarted(csd: ByteArray?) {
+        if (csd != null) configData = csd
         if (started) return
         try {
             val t = HandlerThread("H264Decode").also { it.start() }
@@ -52,7 +55,10 @@ class H264ToJpeg(
             r.setOnImageAvailableListener({ ir ->
                 val img = try { ir.acquireLatestImage() } catch (_: Throwable) { null } ?: return@setOnImageAvailableListener
                 try {
-                    if (shouldEncode()) encodeAndEmit(img)
+                    imgCount++
+                    val enc = shouldEncode()
+                    if (imgCount <= 3 || imgCount % 120 == 0L) Log.i(TAG, "img#$imgCount ${img.width}x${img.height} encode=$enc")
+                    if (enc) encodeAndEmit(img)
                 } catch (t: Throwable) {
                     Log.w(TAG, "encode failed", t)
                 } finally {
@@ -62,7 +68,8 @@ class H264ToJpeg(
             reader = r
 
             val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-                setByteBuffer("csd-0", ByteBuffer.wrap(config))
+                // config 패킷이 있으면 csd-0 지정, 없으면 생략(디코더가 스트림 인라인 SPS/PPS로 구성).
+                configData?.let { setByteBuffer("csd-0", ByteBuffer.wrap(it)) }
             }
             val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             c.setCallback(object : MediaCodec.Callback() {
@@ -83,14 +90,16 @@ class H264ToJpeg(
             c.start()
             codec = c
             started = true
+            startReemitLoop()
             Log.i(TAG, "decoder started ${width}x$height")
         } catch (t: Throwable) {
             Log.e(TAG, "decoder init failed", t)
         }
     }
 
-    /** H.264 프레임(Annex-B, key/delta) 투입. */
+    /** H.264 프레임(Annex-B, key/delta) 투입. 미기동이면 csd 없이 시작(인라인 SPS/PPS). */
     fun submitFrame(frame: ByteArray, isKey: Boolean) {
+        if (!started) ensureStarted(null)
         if (!started) return
         synchronized(this) { pendingFrames.add(frame to isKey) }
         codec?.let { drainInput(it) }
@@ -116,16 +125,47 @@ class H264ToJpeg(
         }
     }
 
+    private var imgCount = 0L
+    private var jpegCount = 0L
+    @Volatile private var lastJpeg: ByteArray? = null
+    @Volatile private var lastEmitMs = 0L
+    private var reemitThread: Thread? = null
+
     private fun encodeAndEmit(img: Image) {
         val nv21 = yuv420ToNv21(img)
         baos.reset()
         val yuv = YuvImage(nv21, ImageFormat.NV21, img.width, img.height, null)
         yuv.compressToJpeg(Rect(0, 0, img.width, img.height), quality, baos)
-        onJpeg(baos.toByteArray())
+        val bytes = baos.toByteArray()
+        jpegCount++
+        if (jpegCount <= 3 || jpegCount % 120 == 0L) Log.i(TAG, "jpeg#$jpegCount ${bytes.size}B")
+        lastJpeg = bytes
+        lastEmitMs = System.currentTimeMillis()
+        onJpeg(bytes)
+    }
+
+    /**
+     * 정적 화면 대비: H.264는 변화 없으면 프레임을 안 보내 디코더 출력이 멈춘다.
+     * 새 프레임이 없을 때 마지막 JPEG를 낮은 주기로 재전송해 뷰어가 항상 현재 화면을 갖게 한다.
+     * (내비처럼 계속 움직이면 이 경로는 거의 안 탄다.)
+     */
+    private fun startReemitLoop() {
+        reemitThread = Thread {
+            while (started) {
+                try { Thread.sleep(REEMIT_INTERVAL_MS) } catch (_: Throwable) { break }
+                val j = lastJpeg ?: continue
+                if (!shouldEncode()) continue
+                if (System.currentTimeMillis() - lastEmitMs >= REEMIT_INTERVAL_MS) {
+                    lastEmitMs = System.currentTimeMillis()
+                    runCatching { onJpeg(j) }
+                }
+            }
+        }.apply { isDaemon = true; start() }
     }
 
     fun stop() {
         started = false
+        runCatching { reemitThread?.interrupt() }; reemitThread = null
         runCatching { codec?.stop() }
         runCatching { codec?.release() }
         runCatching { reader?.close() }
@@ -169,5 +209,6 @@ class H264ToJpeg(
 
     companion object {
         private const val TAG = "H264ToJpeg"
+        private const val REEMIT_INTERVAL_MS = 300L  // 정적 화면 시 마지막 프레임 재전송 주기(~3fps)
     }
 }

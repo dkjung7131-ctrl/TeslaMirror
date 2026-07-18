@@ -36,6 +36,7 @@ class AppCastService : Service() {
         private const val NOTIF_CHANNEL = "tesla_mirror_app"
         private const val NOTIF_ID = 1002
         private const val EXTRA_PACKAGE = "package"
+        private const val EXTRA_INTERNET_PATH = "internet_path"
         private const val ACTION_STOP = "stop"
 
         // 테슬라 브라우저에 맞춘 가로 해상도(대략). 뷰어가 contain으로 맞추므로 정밀하지 않아도 됨.
@@ -53,9 +54,10 @@ class AppCastService : Service() {
         private val _statusFlow = MutableStateFlow("")
         val statusFlow: StateFlow<String> = _statusFlow.asStateFlow()
 
-        fun start(context: Context, packageName: String) {
+        fun start(context: Context, packageName: String, internetPath: Boolean = true) {
             val i = Intent(context, AppCastService::class.java).apply {
                 putExtra(EXTRA_PACKAGE, packageName)
+                putExtra(EXTRA_INTERNET_PATH, internetPath)
             }
             context.startForegroundService(i)
         }
@@ -95,6 +97,7 @@ class AppCastService : Service() {
         }
         val pkg = intent?.getStringExtra(EXTRA_PACKAGE)
         if (pkg.isNullOrBlank()) { stopSelf(); return START_NOT_STICKY }
+        val internetPath = intent.getBooleanExtra(EXTRA_INTERNET_PATH, true)
 
         // 전체화면과 동일하게 시그널링(워커)에 시크릿 필요.
         if (!RendezvousUpdater.isConfigured(this)) {
@@ -110,7 +113,8 @@ class AppCastService : Service() {
             context = this,
             onStatus = { _statusFlow.value = it },
             onViewerMessage = { json -> handleInput(json) },   // Phase 2 터치 역제어
-            internetPath = true,                               // 테슬라 경로(공인 ICE)
+            onConnected = { controller?.sendControl(ScrcpyProtocol.resetVideo()) }, // 새 뷰어에 키프레임
+            internetPath = internetPath,                        // ON=테슬라(공인 ICE), OFF=로컬 host(데스크)
         ).also { webrtc = it }
 
         // scrcpy H.264 → 디코드 → JPEG → 데이터채널. 뷰어가 못 받을 땐 인코딩 스킵.

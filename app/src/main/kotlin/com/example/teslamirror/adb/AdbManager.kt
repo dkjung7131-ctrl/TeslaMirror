@@ -135,6 +135,16 @@ class AdbManager private constructor(context: Context) : AbsAdbConnectionManager
             .also { runCatching { stream.close() } }
     }
 
+    /**
+     * `exec:` 서비스로 명령 실행. scrcpy 서버가 이미 `shell:` 스트림을 점유 중일 때
+     * 두 번째 `shell:`은 libadb에서 "Stream closed"/행 → exec:는 별개 서비스라 공존 가능.
+     */
+    fun runExec(command: String): String {
+        val stream = openStream("exec:$command")
+        return stream.openInputStream().use { it.readBytes().toString(Charsets.UTF_8) }
+            .also { runCatching { stream.close() } }
+    }
+
     companion object {
         @Volatile private var INSTANCE: AdbManager? = null
 
