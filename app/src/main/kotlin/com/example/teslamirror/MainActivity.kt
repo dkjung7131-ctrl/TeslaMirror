@@ -161,7 +161,7 @@ fun HomeScreen() {
     LaunchedEffect(Unit) {
         while (true) {
             val cands = withContext(Dispatchers.IO) { localIpCandidates() }
-            ipText = formatViewerUrls(cands, webrtcMode = !appMode, secretConfigured = regConfigured)
+            ipText = formatViewerUrls(cands, webrtcMode = true, secretConfigured = regConfigured)
             val hotspotIp = cands.firstOrNull { it.isHotspot }?.ip
             if (hotspotIp != null) {
                 RendezvousUpdater.pushIfChanged(context, hotspotIp)?.let { regStatus = it }
@@ -639,18 +639,10 @@ fun HomeScreen() {
 internal data class IpCandidate(val ip: String, val isHotspot: Boolean)
 
 private fun formatViewerUrls(cands: List<IpCandidate>, webrtcMode: Boolean, secretConfigured: Boolean): String {
-    // 전체화면(WebRTC) 모드: 유일한 접속 경로는 공용 워커 주소. 로컬 IP:8080은 이 모드에서
-    // 아무것도 서빙하지 않으므로 표시하지 않는다(테슬라도 사설 IP는 차단).
-    if (webrtcMode) {
-        return if (secretConfigured) RendezvousUpdater.WORKER_URL
-        else "먼저 아래 '공용 접속 주소'에 시크릿을 저장하세요"
-    }
-    // 앱 모드: 로컬 서버(H.264/WS)가 8080에서 뜨므로 로컬 주소 표시.
-    val port = if (HttpConfig.PORT == 80) "" else ":${HttpConfig.PORT}"
-    val hotspot = cands.filter { it.isHotspot }
-    val show = hotspot.ifEmpty { cands }
-    if (show.isEmpty()) return "핫스팟을 켠 뒤 다시 시작하세요"
-    return show.joinToString("\n") { "http://${it.ip}$port" }
+    // 전체화면·앱 모드 **둘 다** 공용 워커 뷰어를 사용한다(테슬라 사설 IP 차단 + 앱 모드도
+    // WebRTC/STUN 경로로 전환됨). 로컬 IP:8080 서버는 더 이상 안 쓴다.
+    return if (secretConfigured) RendezvousUpdater.WORKER_URL
+    else "먼저 아래 '공용 접속 주소'에 시크릿을 저장하세요"
 }
 
 /**

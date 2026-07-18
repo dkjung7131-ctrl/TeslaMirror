@@ -12,9 +12,11 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.example.teslamirror.capture.H264ToJpeg
+import com.example.teslamirror.rendezvous.RendezvousUpdater
 import com.example.teslamirror.scrcpy.ScrcpyController
 import com.example.teslamirror.scrcpy.ScrcpyProtocol
-import com.example.teslamirror.server.MirrorServer
+import com.example.teslamirror.webrtc.AppWebRtcSession
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -65,7 +67,8 @@ class AppCastService : Service() {
     }
 
     private var controller: ScrcpyController? = null
-    private var server: MirrorServer? = null
+    private var webrtc: AppWebRtcSession? = null
+    private var decoder: H264ToJpeg? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val hotspotReceiver = object : BroadcastReceiver() {
@@ -93,16 +96,30 @@ class AppCastService : Service() {
         val pkg = intent?.getStringExtra(EXTRA_PACKAGE)
         if (pkg.isNullOrBlank()) { stopSelf(); return START_NOT_STICKY }
 
+        // 전체화면과 동일하게 시그널링(워커)에 시크릿 필요.
+        if (!RendezvousUpdater.isConfigured(this)) {
+            _statusFlow.value = "공용 접속 주소 시크릿을 먼저 저장하세요"
+            stopSelf(); return START_NOT_STICKY
+        }
+
         startInForeground()
         _statusFlow.value = "시작 중…"
 
-        val srv = MirrorServer(
-            port = HttpConfig.PORT,
-            videoWidth = DISPLAY_WIDTH,
-            videoHeight = DISPLAY_HEIGHT,
-            onInput = { json -> handleInput(json) },
-            onViewerConnected = { controller?.sendControl(ScrcpyProtocol.resetVideo()) },
-        ).also { server = it }
+        // 전송: 전체화면과 같은 워커+STUN+JPEG 데이터채널 (전체화면 코드는 안 건드림).
+        val rtc = AppWebRtcSession(
+            context = this,
+            onStatus = { _statusFlow.value = it },
+            onViewerMessage = { json -> handleInput(json) },   // Phase 2 터치 역제어
+            internetPath = true,                               // 테슬라 경로(공인 ICE)
+        ).also { webrtc = it }
+
+        // scrcpy H.264 → 디코드 → JPEG → 데이터채널. 뷰어가 못 받을 땐 인코딩 스킵.
+        val dec = H264ToJpeg(
+            width = DISPLAY_WIDTH,
+            height = DISPLAY_HEIGHT,
+            shouldEncode = { rtc.canSend() },
+            onJpeg = { jpeg -> rtc.pushJpeg(jpeg) },
+        ).also { decoder = it }
 
         val ctrl = ScrcpyController(
             context = this,
@@ -111,15 +128,15 @@ class AppCastService : Service() {
             dpi = DISPLAY_DPI,
             maxFps = MAX_FPS,
             targetPackage = pkg,
-            onConfig = { cfg -> server?.broadcastH264Config(cfg) },
-            onFrame = { data, key -> server?.broadcastH264Frame(data, key) },
+            onConfig = { cfg -> dec.submitConfig(cfg) },
+            onFrame = { data, key -> dec.submitFrame(data, key) },
             onError = { msg -> Log.w(TAG, msg); _statusFlow.value = msg },
         ).also { controller = it }
 
         // 네트워크/ADB 작업은 별도 스레드에서
         Thread {
             try {
-                srv.start()
+                rtc.start()
                 ctrl.start()
                 _isRunningFlow.value = true
                 _statusFlow.value = "실행 중 — 테슬라에서 접속하세요"
@@ -167,8 +184,9 @@ class AppCastService : Service() {
         _statusFlow.value = ""
         unregisterReceiverSafely()
         runCatching { controller?.stop() }
-        runCatching { server?.stop() }
-        controller = null; server = null
+        runCatching { decoder?.stop() }
+        runCatching { webrtc?.stop() }
+        controller = null; decoder = null; webrtc = null
     }
 
     private fun registerReceiverSafely() {
