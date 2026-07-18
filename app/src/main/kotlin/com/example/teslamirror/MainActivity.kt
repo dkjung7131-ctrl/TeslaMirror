@@ -7,7 +7,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
-import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -53,6 +52,28 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        handleDebugIntents(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleDebugIntents(intent)
+    }
+
+    /** adb: am start -n …/.MainActivity -a com.example.teslamirror.SET_SECRET --es secret '…' */
+    private fun handleDebugIntents(intent: Intent?) {
+        if (intent?.action != ACTION_SET_SECRET) return
+        val s = intent.getStringExtra("secret")?.trim().orEmpty()
+        if (s.isBlank()) {
+            Toast.makeText(this, "secret extra 비어 있음", Toast.LENGTH_SHORT).show()
+            return
+        }
+        RendezvousUpdater.save(this, s)
+        Toast.makeText(this, "시크릿 저장됨 (adb)", Toast.LENGTH_SHORT).show()
+    }
+
+    companion object {
+        const val ACTION_SET_SECRET = "com.example.teslamirror.SET_SECRET"
     }
 }
 
@@ -115,9 +136,8 @@ fun HomeScreen() {
         }
     }
 
-    // 테슬라 직결(VPN 게이트웨이) 모드. 테슬라 브라우저는 사설 IP를 막으므로 실차에선 이게
-    // 켜져 있어야 한다. 핫스팟에 붙은 PC 뷰어는 꺼도 됨(사설 IP로 접속).
-    var useVpn by remember { mutableStateOf(true) }
+    // 테슬라 동일 경로: STUN 공인 후보만(사설 제거). OFF=사설만(로컬 디버그).
+    var internetPath by remember { mutableStateOf(true) }
 
     // 접선 서버 시크릿 — 저장된 값은 폰에만 있음 (SharedPreferences). 서버 주소는 코드에 고정.
     var regConfigured by remember { mutableStateOf(RendezvousUpdater.isConfigured(context)) }
@@ -233,13 +253,15 @@ fun HomeScreen() {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            ScreenCaptureService.start(context, result.resultCode, result.data!!, fps, useVpn = useVpn)
+            ScreenCaptureService.start(
+                context, result.resultCode, result.data!!, fps,
+                internetPath = internetPath,
+            )
             ipText = formatViewerUrls(localIpCandidates(), webrtcMode = !appMode, secretConfigured = regConfigured)
         }
     }
 
-    // 화면 캡처 권한 요청(위 projectionLauncher)을 실제로 띄우는 헬퍼.
-    val launchProjection = {
+    val beginFullscreen = {
         val captureIntent = if (Build.VERSION.SDK_INT >= 34) {
             projectionManager.createScreenCaptureIntent(
                 MediaProjectionConfig.createConfigForDefaultDisplay()
@@ -248,33 +270,6 @@ fun HomeScreen() {
             projectionManager.createScreenCaptureIntent()
         }
         projectionLauncher.launch(captureIntent)
-    }
-
-    // VPN 권한 승인 결과 → 승인되면 게이트웨이 서비스 기동 후 화면 캡처 요청으로 진행.
-    val vpnConsentLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            GatewayVpnService.start(context)
-            launchProjection()
-        } else {
-            Toast.makeText(context, "테슬라 직결에는 VPN 권한이 필요합니다", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    // 전체화면 시작 진입점: VPN 모드면 권한 승인/서비스 기동 후, 아니면 바로 화면 캡처.
-    val beginFullscreen = {
-        if (useVpn) {
-            val prep = VpnService.prepare(context)   // 이미 승인됐으면 null
-            if (prep != null) {
-                vpnConsentLauncher.launch(prep)
-            } else {
-                GatewayVpnService.start(context)
-                launchProjection()
-            }
-        } else {
-            launchProjection()
-        }
     }
 
     Column(
@@ -483,7 +478,6 @@ fun HomeScreen() {
         }
 
         if (!appMode) {
-        // 테슬라 직결(VPN) 토글 — 실차는 켜기, 핫스팟 PC 뷰어 테스트는 꺼도 됨.
         Card {
             Row(
                 modifier = Modifier
@@ -493,15 +487,19 @@ fun HomeScreen() {
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("테슬라 직결 (VPN)", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                    Text("테슬라 동일 경로 (공인만)", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "테슬라 브라우저의 사설 IP 차단을 우회합니다. 실차에서는 켜세요.",
+                        "ON=사설 후보 제거·STUN 공인만(핫스팟 노트북=테슬라와 동일 조건). OFF=사설만(로컬 디버그, 테슬라 불가).",
                         fontSize = 13.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         lineHeight = 17.sp
                     )
                 }
-                Switch(checked = useVpn, onCheckedChange = { useVpn = it }, enabled = !running)
+                Switch(
+                    checked = internetPath,
+                    onCheckedChange = { internetPath = it },
+                    enabled = !running
+                )
             }
         }
         if (!running) {
@@ -528,7 +526,7 @@ fun HomeScreen() {
                                 notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                             }
                         }
-                        beginFullscreen()   // VPN 모드면 권한 승인→게이트웨이 기동 후 화면 캡처
+                        beginFullscreen()
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
@@ -544,7 +542,7 @@ fun HomeScreen() {
             Button(
                 onClick = {
                     ScreenCaptureService.stop(context)
-                    GatewayVpnService.stop(context)   // 게이트웨이 VPN도 함께 종료
+                    GatewayVpnService.stop(context) // 혹시 남은 VPN 정리
                 },
                 modifier = Modifier.fillMaxWidth(),
                 contentPadding = PaddingValues(vertical = 18.dp),

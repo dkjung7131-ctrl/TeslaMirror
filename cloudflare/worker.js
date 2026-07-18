@@ -1,9 +1,9 @@
 // TeslaMirror 시그널링 서버 — Cloudflare Worker
 //
-// 테슬라 브라우저는 사설 IP(10.x/192.168.x) 직접 접속을 막는다(about:blank#blocked).
-// 그래서 공개 HTTPS 페이지를 워커가 서빙하고, 폰↔테슬라를 WebRTC로 P2P 연결한다.
-// ICE가 같은 핫스팟의 로컬 경로를 찾으므로 영상은 로컬 직통(저지연·무과금)으로 흐르고,
-// 페이지 origin은 공개라 사설 IP 차단을 원천 회피한다. (Tesor와 동일한 접근)
+// 테슬라 브라우저는 사설 IP 직접 접속을 막는다(about:blank#blocked) + LAN WebRTC UDP도
+// 로컬로 못 냄(실차 실측). 공개 HTTPS 페이지 + 시그널링은 워커가 담당.
+// 미디어: 비루트 VpnService 가로채기 실패 → 기본은 STUN 공인 ICE(인터넷 경로, 지연↑).
+// PC 핫스팟 로컬 테스트는 앱에서 "인터넷 ICE"를 끄면 사설 host 후보만 사용.
 //
 // 엔드포인트:
 //   POST /register  {deviceId,name,hotspotIp}  (Bearer SECRET) — 폰 등록(발견용)
@@ -161,84 +161,158 @@ ${items ? '<p>접속할 폰을 선택하세요</p>' : ''}
 </body></html>`;
 }
 
-// WebRTC 뷰어 — 공개 HTTPS 페이지. 폰의 오퍼를 받아 앤서를 올리고, JPEG 프레임을
-// 데이터 채널로 받아 캔버스에 즉시 그린다(버퍼 없음 → 내비 실시간성).
+// WebRTC 뷰어 — 문자열 연결로 생성(큰 템플릿 리터럴은 CF 대시보드 붙여넣기에서 깨지기 쉬움).
+// 좌/중/우 정렬 + 여백 시계.
 function viewerHtml(deviceId) {
-  return `<!doctype html>
-<html lang="ko"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>TeslaMirror</title><style>
-  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:sans-serif;color:#fff}
-  #c{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
-  #s{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);font-size:20px;opacity:.85;text-align:center;line-height:1.6}
-  #st{position:fixed;left:8px;bottom:8px;font-size:12px;font-family:monospace;color:#7f7;background:rgba(0,0,0,.5);padding:4px 8px;border-radius:6px;z-index:9}
-</style></head><body>
-<canvas id="c"></canvas>
-<div id="s">연결 중…</div>
-<div id="st"></div>
-<script>
-(function(){
-  var DEVICE_ID=${JSON.stringify(String(deviceId)).replace(/</g, '\\u003c')};
-  var s=document.getElementById('s'), stEl=document.getElementById('st');
-  var canvas=document.getElementById('c'), ctx=canvas.getContext('2d');
-  function st(t){ s.style.display=t?'':'none'; s.textContent=t||''; }
-  function iceDone(pc){ return new Promise(function(res){
-    if(pc.iceGatheringState==='complete') return res();
-    var t=setTimeout(res,3000);
-    pc.addEventListener('icegatheringstatechange',function(){ if(pc.iceGatheringState==='complete'){clearTimeout(t);res();} });
-  }); }
-  var pc=null, tries=0, drawing=false, fpsCount=0, lastFpsT=Date.now(), fps=0;
-  function drawJpeg(buf){
-    if(drawing) return;              // 디코드 중이면 새 프레임은 버림(백로그 방지 → 최신 우선)
-    drawing=true;
-    var blob=new Blob([buf],{type:'image/jpeg'});
-    createImageBitmap(blob).then(function(bmp){
-      if(canvas.width!==bmp.width){ canvas.width=bmp.width; canvas.height=bmp.height; }
-      ctx.drawImage(bmp,0,0); bmp.close(); drawing=false;
-      st(''); fpsCount++;
-      var now=Date.now(); if(now-lastFpsT>=1000){ fps=fpsCount; fpsCount=0; lastFpsT=now; }
-    }).catch(function(){ drawing=false; });
-  }
-  async function connect(){
-    try{
-      var r=await fetch('/offer?id='+encodeURIComponent(DEVICE_ID),{cache:'no-store'});
-      if(!r.ok){ st('폰 대기 중… (앱에서 미러링을 시작하세요)'); return schedule(); }
-      var offer=await r.json();
-      if(pc){ try{pc.close();}catch(e){} }
-      pc=new RTCPeerConnection({iceServers:[]});   // STUN 없음: 로컬 host만
-      window.pc=pc;
-      pc.ondatachannel=function(e){
-        var dc=e.channel; dc.binaryType='arraybuffer';
-        dc.onmessage=function(ev){ drawJpeg(ev.data); };
-      };
-      pc.onconnectionstatechange=function(){
-        if(pc.connectionState==='connected') st('');
-        if(pc.connectionState==='failed'||pc.connectionState==='disconnected'||pc.connectionState==='closed'){ st('재연결 중…'); schedule(); }
-      };
-      await pc.setRemoteDescription({type:'offer',sdp:offer.sdp});
-      var ans=await pc.createAnswer();
-      await pc.setLocalDescription(ans);
-      await iceDone(pc);
-      await fetch('/answer',{method:'POST',headers:{'content-type':'application/json'},
-        body:JSON.stringify({deviceId:DEVICE_ID,offerId:offer.offerId,sdp:pc.localDescription.sdp})});
-    }catch(e){ st('오류: '+e.message); schedule(); }
-  }
-  function schedule(){ tries++; setTimeout(connect, Math.min(700+tries*400,3000)); }
-  connect();
-  // 경로/지연/fps 표시
-  setInterval(async function(){
-    if(!pc || pc.connectionState!=='connected'){ stEl.textContent=''; return; }
-    try{
-      var stats=await pc.getStats(), pair=null, cands={};
-      stats.forEach(function(x){ if(x.type==='local-candidate'||x.type==='remote-candidate') cands[x.id]=x; });
-      stats.forEach(function(x){ if(x.type==='candidate-pair' && x.nominated && x.state==='succeeded') pair=x; });
-      if(!pair){ stats.forEach(function(x){ if(x.type==='transport' && x.selectedCandidatePairId) pair=stats.get(x.selectedCandidatePairId); }); }
-      var rtt='?'; if(pair && pair.currentRoundTripTime!=null) rtt=Math.round(pair.currentRoundTripTime*1000)+'ms';
-      var lt=pair?(cands[pair.localCandidateId]||{}).candidateType:'?';
-      stEl.textContent=lt+' rtt '+rtt+' · '+fps+'fps';
-    }catch(e){}
-  }, 1000);
-})();
-</script>
-</body></html>`;
+  var idLit = JSON.stringify(String(deviceId));
+  var css =
+    'html,body{margin:0;height:100%;background:#000;overflow:hidden;' +
+    'font-family:system-ui,sans-serif;color:#fff;-webkit-user-select:none;user-select:none}' +
+    '#stage{position:fixed;inset:0;background:#000}' +
+    '#c{position:absolute;top:50%;transform:translateY(-50%);' +
+    'max-width:100%;max-height:100%;width:auto;height:auto;background:#000;z-index:2}' +
+    '#c.pos-left{left:0;right:auto}' +
+    '#c.pos-center{left:50%;right:auto;transform:translate(-50%,-50%)}' +
+    '#c.pos-right{left:auto;right:0}' +
+    '#clkL,#clkR{position:fixed;top:0;bottom:0;width:28%;display:flex;flex-direction:column;' +
+    'align-items:center;justify-content:center;z-index:1;pointer-events:none;opacity:0;transition:opacity .25s}' +
+    '#clkL{left:0}#clkR{right:0}#clkL.show,#clkR.show{opacity:1}' +
+    '.time{font-size:48px;font-weight:300;letter-spacing:.04em;opacity:.92}' +
+    '.date{font-size:16px;opacity:.55;margin-top:10px}' +
+    '#s{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);font-size:20px;' +
+    'opacity:.85;text-align:center;line-height:1.6;z-index:5}' +
+    '#st{position:fixed;left:8px;bottom:8px;font-size:12px;font-family:monospace;color:#7f7;' +
+    'background:rgba(0,0,0,.5);padding:4px 8px;border-radius:6px;z-index:9}' +
+    '#bar{position:fixed;right:10px;bottom:10px;display:flex;gap:8px;z-index:10}' +
+    '#bar button{width:48px;height:48px;border-radius:12px;border:1px solid rgba(255,255,255,.28);' +
+    'background:rgba(0,0,0,.45);color:#fff;font-size:18px;cursor:pointer}' +
+    '#bar button.on{background:rgba(37,99,235,.75);border-color:rgba(147,197,253,.8)}';
+
+  var js =
+    '(function(){\n' +
+    'var DEVICE_ID=' + idLit + ';\n' +
+    'var s=document.getElementById("s"), stEl=document.getElementById("st");\n' +
+    'var canvas=document.getElementById("c"), ctx=canvas.getContext("2d");\n' +
+    'var clkL=document.getElementById("clkL"), clkR=document.getElementById("clkR");\n' +
+    'var POS_KEY="tm_pos";\n' +
+    'var pos=localStorage.getItem(POS_KEY)||"center";\n' +
+    'if(pos!=="left"&&pos!=="right"&&pos!=="center") pos="center";\n' +
+    'function st(t){ s.style.display=t?"":"none"; s.textContent=t||""; }\n' +
+    'function setPos(p){\n' +
+    '  pos=p; localStorage.setItem(POS_KEY,p);\n' +
+    '  canvas.className="pos-"+p;\n' +
+    '  document.getElementById("bL").className=p==="left"?"on":"";\n' +
+    '  document.getElementById("bC").className=p==="center"?"on":"";\n' +
+    '  document.getElementById("bR").className=p==="right"?"on":"";\n' +
+    '  updateClocksVisible();\n' +
+    '}\n' +
+    'document.getElementById("bL").onclick=function(){ setPos("left"); };\n' +
+    'document.getElementById("bC").onclick=function(){ setPos("center"); };\n' +
+    'document.getElementById("bR").onclick=function(){ setPos("right"); };\n' +
+    'setPos(pos);\n' +
+    'function pad(n){ return n<10?"0"+n:""+n; }\n' +
+    'function tickClock(){\n' +
+    '  var now=new Date();\n' +
+    '  var t=pad(now.getHours())+":"+pad(now.getMinutes());\n' +
+    '  var d=now.getFullYear()+"."+pad(now.getMonth()+1)+"."+pad(now.getDate());\n' +
+    '  document.getElementById("tL").textContent=t;\n' +
+    '  document.getElementById("tR").textContent=t;\n' +
+    '  document.getElementById("dL").textContent=d;\n' +
+    '  document.getElementById("dR").textContent=d;\n' +
+    '}\n' +
+    'tickClock(); setInterval(tickClock,1000);\n' +
+    'function updateClocksVisible(){\n' +
+    '  var vw=window.innerWidth||1, vh=window.innerHeight||1;\n' +
+    '  var cw=canvas.width||0, ch=canvas.height||0;\n' +
+    '  var scale=1;\n' +
+    '  if(cw>0&&ch>0) scale=Math.min(vw/cw, vh/ch);\n' +
+    '  var dw=cw*scale, gap=vw-dw;\n' +
+    '  var show=gap>96;\n' +
+    '  if(pos==="left"){ clkL.className=""; clkR.className=show?"show":""; }\n' +
+    '  else if(pos==="right"){ clkR.className=""; clkL.className=show?"show":""; }\n' +
+    '  else { clkL.className=show?"show":""; clkR.className=show?"show":""; }\n' +
+    '}\n' +
+    'window.addEventListener("resize", updateClocksVisible);\n' +
+    'function iceDone(pc){ return new Promise(function(res){\n' +
+    '  if(pc.iceGatheringState==="complete") return res();\n' +
+    '  var t=setTimeout(res,3000);\n' +
+    '  pc.addEventListener("icegatheringstatechange",function(){\n' +
+    '    if(pc.iceGatheringState==="complete"){ clearTimeout(t); res(); }\n' +
+    '  });\n' +
+    '}); }\n' +
+    'var pc=null, tries=0, drawing=false, fpsCount=0, lastFpsT=Date.now(), fps=0;\n' +
+    'function drawJpeg(buf){\n' +
+    '  if(drawing) return;\n' +
+    '  drawing=true;\n' +
+    '  var blob=new Blob([buf],{type:"image/jpeg"});\n' +
+    '  createImageBitmap(blob).then(function(bmp){\n' +
+    '    if(canvas.width!==bmp.width){ canvas.width=bmp.width; canvas.height=bmp.height; }\n' +
+    '    ctx.drawImage(bmp,0,0); bmp.close(); drawing=false;\n' +
+    '    st(""); fpsCount++;\n' +
+    '    var now=Date.now(); if(now-lastFpsT>=1000){ fps=fpsCount; fpsCount=0; lastFpsT=now; }\n' +
+    '    updateClocksVisible();\n' +
+    '  }).catch(function(){ drawing=false; });\n' +
+    '}\n' +
+    'async function connect(){\n' +
+    '  try{\n' +
+    '    var r=await fetch("/offer?id="+encodeURIComponent(DEVICE_ID),{cache:"no-store"});\n' +
+    '    if(!r.ok){ st("폰 대기 중... (앱에서 미러링 시작)"); return schedule(); }\n' +
+    '    var offer=await r.json();\n' +
+    '    if(pc){ try{pc.close();}catch(e){} }\n' +
+    '    pc=new RTCPeerConnection({iceServers:[\n' +
+    '      {urls:"stun:stun.l.google.com:19302"},\n' +
+    '      {urls:"stun:stun1.l.google.com:19302"}\n' +
+    '    ]});\n' +
+    '    window.pc=pc;\n' +
+    '    pc.ondatachannel=function(e){\n' +
+    '      var dc=e.channel; dc.binaryType="arraybuffer";\n' +
+    '      dc.onmessage=function(ev){ drawJpeg(ev.data); };\n' +
+    '    };\n' +
+    '    pc.onconnectionstatechange=function(){\n' +
+    '      if(pc.connectionState==="connected") st("");\n' +
+    '      if(pc.connectionState==="failed"||pc.connectionState==="disconnected"||pc.connectionState==="closed"){\n' +
+    '        st("재연결 중..."); schedule();\n' +
+    '      }\n' +
+    '    };\n' +
+    '    await pc.setRemoteDescription({type:"offer",sdp:offer.sdp});\n' +
+    '    var ans=await pc.createAnswer();\n' +
+    '    await pc.setLocalDescription(ans);\n' +
+    '    await iceDone(pc);\n' +
+    '    await fetch("/answer",{method:"POST",headers:{"content-type":"application/json"},\n' +
+    '      body:JSON.stringify({deviceId:DEVICE_ID,offerId:offer.offerId,sdp:pc.localDescription.sdp})});\n' +
+    '  }catch(e){ st("오류: "+e.message); schedule(); }\n' +
+    '}\n' +
+    'function schedule(){ tries++; setTimeout(connect, Math.min(700+tries*400,3000)); }\n' +
+    'connect();\n' +
+    'setInterval(async function(){\n' +
+    '  if(!pc || pc.connectionState!=="connected"){ stEl.textContent=""; return; }\n' +
+    '  try{\n' +
+    '    var stats=await pc.getStats(), pair=null, cands={};\n' +
+    '    stats.forEach(function(x){ if(x.type==="local-candidate"||x.type==="remote-candidate") cands[x.id]=x; });\n' +
+    '    stats.forEach(function(x){ if(x.type==="candidate-pair" && x.nominated && x.state==="succeeded") pair=x; });\n' +
+    '    if(!pair){ stats.forEach(function(x){ if(x.type==="transport" && x.selectedCandidatePairId) pair=stats.get(x.selectedCandidatePairId); }); }\n' +
+    '    var rtt="?"; if(pair && pair.currentRoundTripTime!=null) rtt=Math.round(pair.currentRoundTripTime*1000)+"ms";\n' +
+    '    var lt=pair?(cands[pair.localCandidateId]||{}).candidateType:"?";\n' +
+    '    stEl.textContent=lt+" rtt "+rtt+" | "+fps+"fps";\n' +
+    '  }catch(e){}\n' +
+    '}, 1000);\n' +
+    '})();';
+
+  return (
+    '<!doctype html><html lang="ko"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">' +
+    '<title>TeslaMirror</title><style>' + css + '</style></head><body>' +
+    '<div id="stage">' +
+    '<div id="clkL"><div class="time" id="tL">--:--</div><div class="date" id="dL"></div></div>' +
+    '<canvas id="c" class="pos-center"></canvas>' +
+    '<div id="clkR"><div class="time" id="tR">--:--</div><div class="date" id="dR"></div></div>' +
+    '</div>' +
+    '<div id="s">연결 중...</div><div id="st"></div>' +
+    '<div id="bar">' +
+    '<button type="button" id="bL" title="left">&lt;</button>' +
+    '<button type="button" id="bC" title="center">o</button>' +
+    '<button type="button" id="bR" title="right">&gt;</button>' +
+    '</div>' +
+    '<script>' + js + '</script></body></html>'
+  );
 }

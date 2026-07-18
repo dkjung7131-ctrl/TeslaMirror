@@ -1,62 +1,86 @@
 # VpnService 게이트웨이 (테슬라 LAN 격리 우회) — 진행 상태
 
-> 브랜치: `feature/vpn-gateway` · 최종 갱신: 2026-07-17 · 상태: **미해결(마지막 변형 검증 대기)**
+> 브랜치: `feature/vpn-gateway` · 최종 갱신: 2026-07-18 · 상태: **순수 앱 가로채기 소진 (확정)**
 
 ## 목표
-테슬라 인포테인먼트 브라우저를 통해 폰 화면을 미러링. 테슬라 브라우저는 **사설 IP
-(10/8·172.16-31/12·192.168/16) 목적지를 차단**하고, Wi-Fi로 폰 핫스팟에 붙어 있어도
-**WebRTC UDP를 로컬로 못 보냄**(실차 실측). 그래서 뷰어에게 **가짜 공인 IP**를 후보로
-광고하고, 폰이 그 IP로 오는 트래픽을 받아 로컬 WebRTC로 이어주는 게 핵심.
+테슬라 브라우저로 폰 화면 미러링. 브라우저는 **사설 IP 차단** + 핫스팟에서도
+**로컬 WebRTC UDP 불가**(실차). 가짜/가상 공인 계열 IP로 로컬 경로를 만드는 게 목표.
 
-## 토폴로지 (차 = 폰 핫스팟의 클라이언트, 폰 = 게이트웨이)
+## 데스크 최종 실측 (S936N / Android 16 / 비루트)
+
+조건: PC=`10.185.144.100` · 폰 AP=`10.185.144.171` · 게이트웨이=폰 · 핫스팟 경로 정상.
+
+| # | 시도 | 결과 |
+|---|------|------|
+| 1 | PC → **실제 AP** UDP/TCP | ✅ 수신 (`PROBE RECV[C-ap]`, HTTP 200) |
+| 2 | ROUTE_ONLY `203.0.113.7` (미소유+route) | ❌ tun `rx=0` |
+| 3 | OWN `203.0.113.7` (이전) | ❌ 소켓·tun 0 |
+| 4 | **OWN_CGNAT `100.99.9.9`** (상용 TeslaMirror FAQ IP) + TCP:3333 | ❌ PC→가상IP HTTP 타임아웃 · UDP 미수신 · `tunRx=0` |
+| 4b | 동일 세션 **폰 자체** → `100.99.9.9:3333` | ✅ HTTP 200 (소유·로컬 서빙은 됨) |
+| 5 | 동일 세션 PC→**실제 AP**:3333 | ✅ HTTP 200 (대조군) |
+| 6 | `pm grant MANAGE_TEST_NETWORKS` | ❌ `prot=signature` — 변경 불가 |
+| 7 | Shizuku/`adb shell` `ip`/`iptables` | ❌ root 필요 (이전) |
+
+### 확정 결론
+1. 핫스팟·앱 소켓·PC 라우팅은 **정상**.
+2. 클라이언트가 **가상/가짜 IP**로 보낸 트래픽은 이 기기에서 **앱까지 배달되지 않음**
+   (UDP·TCP 동일, TEST-NET·CGNAT 동일).
+3. 상용 앱이 FAQ에 적은 `100.99.9.9` **소유 방식만으로는 이 갤럭시에서 재현 실패**.
+4. **순수 앱 `VpnService` 가로채기 = 소진.**
+
+## 상용/경쟁 앱에서 알아낸 것 (자동 조사)
+
+### hustmobile TeslaMirror (Play: `com.hustmobile.teslamirror`)
+- FAQ: Android 가상 IP **`100.99.9.9`**, MJPEG `http://100.99.9.9:3333`
+- iOS: **`240.3.3.3`**
+- 주장: 공개 VPN 서버 없음, 핫스팟 LAN만
+- **단, H.264 모드는 `https://TSL6.com`** → DNS = **Cloudflare 공인 IP**
+  (`104.21.x`, `172.67.x`). 로컬 전용 주장과 별개로 **공개 도메인 경로 존재**.
+- `tslamirror.com` A 레코드 = `240.3.3.3` (가상 IP를 DNS에 박음)
+
+→ 최신 H.264는 **공개 HTTPS(CF) 경유**일 가능성 큼. MJPEG 가상 IP 경로가
+  삼성/Android 16에서 실제로 되는지는 미검증(우리 재현은 실패).
+
+### Tesor (arter97, `com.arter97.tesor`)
+- 스토어: 로컬 VpnService, 서버 VPN 없음, Shizuku 언급 사례 있음
+- 공개 매뉴얼/APK 상세 메커니즘 **미확보** (사이트 타임아웃)
+- 폰에 미설치 → 패킷 관측 불가
+
+### MANAGE_TEST_NETWORKS / TestNetworkManager
+- 권한 **`prot=signature`** (시스템 서명만)
+- `adb pm grant` **불가** → “1회 ADB로 특수권한” 경로 **이 권한으로는 막힘**
+
+## 남는 선택지
+
+| # | 옵션 | 자동 검증 | 비고 |
+|---|------|-----------|------|
+| A | **공개 경로 미디어** (CF Worker/도메인, TSL6 유사) | 시그널링 워커 이미 있음 | 지연↑, 내비 타협 필요 |
+| B | Tesor/상용 앱 **실설치 후 PCAP·후보 관측** | 사용자 설치 필요 | 진짜 메커니즘 확정 |
+| C | 루팅 + `ip addr`/NAT | 비희망 | 기술적으로 확실 |
+| D | 프로젝트 전제 재검토 | — | 브라우저 미러링 유지 여부 |
+
+**권장 다음 (코드 반영됨, 실차 검증 대기): 인터넷 ICE(STUN)**  
+- 앱 기본: 「인터넷 ICE (실차용)」 ON → Google STUN + 사설 후보 제거  
+- 워커 뷰어: `iceServers` STUN 추가 (`cloudflare/worker.js` — **재배포 필요**)  
+- 지연은 로컬보다 큼. 실차에서 연결·RTT 측정 후 TURN/품질 타협 여부 결정.  
+- 로컬 가로채기(VpnService)는 이 기기 비루트로 **종료**.
+
+## 재시도 금지
+- 순수 앱 `addAddress` / `addRoute` only 가로채기 (TEST-NET·CGNAT 포함)
+- `MANAGE_TEST_NETWORKS` adb grant
+- Shizuku 셸 `ip`/`iptables`
+
+## 프로브 재현
+```text
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.example.teslamirror.debug/com.example.teslamirror.MainActivity \
+  -a com.example.teslamirror.START_VPN_PROBE
+# PC on hotspot:
+.\scripts\vpn-probe.ps1
+adb logcat -s GatewayVpn:I
 ```
-[테슬라 브라우저] --(FAKE_IP로 UDP)--> [폰=게이트웨이/핫스팟] --?--> [폰의 libwebrtc]
-                    (사설IP는 차단됨)          여기서 잡아채야 함
-```
-데스크 검증은 **이 PC를 차 대신** 사용(핫스팟 클라이언트, 게이트웨이=폰, 경로 동일).
-`Find-NetRoute 203.0.113.7` → NextHop = 폰(10.110.236.230) 확인.
 
-## 데스크 실측 결과 (2026-07-17, S936N/Android 16, 비루트)
-
-| 시도 | 구성 | 결과 |
-|------|------|------|
-| 대조군 | PC→**폰 실제 AP IP** 10.110.236.230:9999, 앱 `0.0.0.0:9999` 소켓 | ✅ **수신됨** |
-| addAddress 방식 | tun에 `addAddress(FAKE_IP)`+`addRoute(FAKE_IP)`, 소켓 `0.0.0.0`/`FAKE_IP` | ❌ 소켓·tun 어디에도 안 옴 |
-| Shizuku 권한 | `adb shell`(=uid 2000) `ip addr add dev swlan0` / `iptables -t nat` | ❌ 둘 다 "must be root" |
-
-**결론(확정):**
-- tun에 **소유(addAddress)한** 주소로는 외부 클라이언트 패킷이 앱에 배달 안 됨(로컬 INPUT 처리→드롭).
-- 폰이 클라이언트 패킷을 받는 자기 IP는 항상 사설 → 테슬라가 차단. 공인 IP를 실인터페이스에
-  붙이려면 **root 필요**. Shizuku 셸 권한으로도 IP추가/NAT 불가.
-
-## 마지막 미검증 변형 (v0.6.4-probe, 검증 대기)
-**가설:** FAKE_IP를 `addAddress`로 **소유하지 않고** `addRoute(FAKE_IP/32)`만 건다
-(tun 주소는 더미 `10.99.99.2`). 그러면 클라이언트의 FAKE_IP 패킷이 "로컬 INPUT"이 아니라
-**"포워딩" 대상**이 되어 라우트 따라 **tun fd로 들어올** 수 있음.
-- 되면: `GatewayVpnService.pump()`가 tun에서 읽어 `apAddr:dstPort`(libwebrtc 사설 후보 소켓)로
-  릴레이 → 응답을 src=FAKE_IP로 tun 재주입 → 연결 성립 가능.
-- 코드: `GatewayVpnService.establish()`가 `addAddress(TUN_ADDR)`+`addRoute(FAKE_IP)`로 변경됨.
-  진단: `startProbeSocket()`(0.0.0.0:9999, FAKE_IP:9998) + pump `rx #` 로그.
-- **검증 방법(데스크):** 앱에서 미러링 시작→화면공유 취소(VPN만 기동) → PC에서
-  `203.0.113.7:9999`로 UDP 프로브 → logcat `GatewayVpn`에 **`rx #`** 뜨면 성공(포워딩→tun 캡처).
-
-## v0.6.4 실패 시 남는 선택지 (순수 앱 VpnService 소진)
-1. **Tesor 정확한 메커니즘 역공학** — Shizuku로 접근하는 특정 hidden system API. (조사 에이전트
-   1차 실패. Tesor는 Play상 "no root + Shizuku"라는데 Shizuku 셸론 IP/NAT 불가가 확인됨 →
-   system_server 측 권한을 쓰는 hidden binder API 추정, 미확인.)
-2. **1회성 ADB 특수권한 부여** — `pm grant`로 `MANAGE_TEST_NETWORKS` 등 → `TestNetworkManager`로
-   공인 IP 인터페이스 생성해 수신 가능한지. (영구 루팅 아님, 최초 1회 ADB 설정. 미검증.)
-3. **루팅** — `ip addr add`/`iptables DNAT`로 즉시 해결되나 사용자가 루팅 비희망.
-4. **접근 재검토** — 비루트로 테슬라 브라우저 경유가 불가면 프로젝트 방향 재고.
-
-## 안 되는 것(재시도 금지)
-- 순수 앱 VpnService `addAddress(FAKE_IP)` — 확정 불가(위 표).
-- Shizuku/adb 셸의 `ip`/`iptables` — root 필요.
-- 셀룰러 경유 TURN — 지연 폭증(내비 부적합), 설계상 배제.
-
-## 기타 확정 사실 (별도 이슈, 이미 반영됨)
-- WebRTC 네이티브 `dispose()` 금지 → SIGILL 크래시(close()만). memory 참고.
-- 뷰어 동시 1개(PeerConnection 1). 12초 미연결 시 재offer(포트 바뀜) — VPN 경로에선 이 churn도
-  재검토 필요.
-- Android 16: 화면 잠금 시 MediaProjection 강제 종료.
-- 갤럭시: 핫스팟+USB 디버깅 동시 사용 시 adb 끊김 잦음 → 무선 디버깅 권장.
+## 코드 상태 (이 브랜치)
+- `GatewayVpnService`: OWN_CGNAT 프로브 (`100.99.9.9`, TCP:3333, UDP 프로브)
+- `MainActivity`: `START_VPN_PROBE` adb 인텐트 + UI 「VPN 프로브만」
+- `scripts/vpn-probe.ps1`: 대조군 + 가상IP UDP/TCP

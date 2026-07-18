@@ -11,67 +11,87 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.example.teslamirror.MainActivity
+import java.io.BufferedReader
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
+import java.net.ServerSocket
+import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 테슬라 브라우저 LAN 격리 우회 게이트웨이 (Tesor 방식) — tun 릴레이.
+ * 게이트웨이 프로브 서비스.
  *
- * 배경/실측(memory: teslamirror-tesla-browser-lan-isolation):
- * 테슬라 브라우저는 사설 IP로는 UDP를 안 보낸다. 그래서 뷰어에겐 가짜 공인 IP([FAKE_IP])를
- * 후보로 광고한다(WebRtcSession이 offer의 사설 후보를 FAKE_IP로 재작성, 포트 유지).
+ * 모드 OWN_CGNAT (상용 TeslaMirror 계열 재현):
+ *  - FAKE_IP = 100.99.9.9 (CGNAT/RFC6598 — 테슬라가 막는 10/172.16/192.168 과 다름)
+ *  - tun에 addAddress(FAKE_IP) + addRoute(FAKE_IP/32)
+ *  - TCP :3333 (상용 MJPEG 포트) + UDP 프로브 소켓
+ *  - PC(핫스팟 클라이언트)에서 접속 가능한지가 성공 판정
  *
- * 폰이 차의 게이트웨이(핫스팟)이고 이 서비스가 [FAKE_IP]를 addAddress+addRoute로 tun에
- * 소유하므로, 차가 [FAKE_IP]:P로 보낸 WebRTC UDP는 **tun fd로 들어온다(실차 실측 2026-07-17:
- * "tun ingress" 확인)**. 여기서 그 패킷을 폰의 실제 libwebrtc 포트(핫스팟IP:P — 재작성이 포트를
- * 보존하므로 목적지 포트 P가 그대로 libwebrtc의 사설 후보 포트)로 릴레이하고, libwebrtc의
- * 응답을 src=[FAKE_IP]:P로 다시 IPv4/UDP로 감싸 tun에 써 넣는다. 차 NAT가 브라우저로 되돌린다.
- * 경로는 전부 로컬(핫스팟) → 저지연.
+ * 이전 확정 실패:
+ *  - ROUTE_ONLY(203.0.113.7, 미소유) → tun rx=0
+ *  - addAddress(203.0.113.7) → 수신 0 (이전 데스크)
+ *  - MANAGE_TEST_NETWORKS → signature only, adb grant 불가
  */
 class GatewayVpnService : VpnService() {
 
     @Volatile private var tun: ParcelFileDescriptor? = null
     @Volatile private var running = false
     private var pumpThread: Thread? = null
+    private var heartbeatThread: Thread? = null
+    private val rxCount = AtomicLong(0)
+    private val tcpCount = AtomicLong(0)
 
     private val relays = ConcurrentHashMap<String, RelaySocket>()
     private val fakeIpInt = Ipv4Udp.ipFromString(FAKE_IP)
-    // libwebrtc host 후보가 바인딩된 폰 로컬 주소(swlan0 IPv4). 재작성이 포트를 보존하므로
-    // 릴레이는 (apAddr, tun에서 본 dstPort)로 전달하면 libwebrtc 사설 후보 소켓에 도달한다.
     @Volatile private var apAddr: InetAddress = InetAddress.getByName("127.0.0.1")
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
-        if (running) return START_STICKY
+        if (intent?.action == ACTION_STOP) {
+            teardown("stop-intent")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (running) {
+            Log.i(TAG, "already running; ignore start")
+            return START_STICKY
+        }
         startForegroundNotif()
         apAddr = resolveApAddress() ?: InetAddress.getByName("127.0.0.1")
-        if (!establish()) { stopSelf(); return START_NOT_STICKY }
+        if (!establish()) {
+            teardown("establish-fail")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         running = true
         pumpThread = Thread({ pump() }, "GatewayVpnPump").also { it.start() }
-        startProbeSocket()   // [진단] FAKE_IP:9999에 실소켓 바인딩 — 로컬배달 여부 판정
-        Log.i(TAG, "started; $FAKE_IP → relay to ${apAddr.hostAddress}:<dstPort>")
-        return START_STICKY
+        startProbes()
+        startTcpProbe()
+        startHeartbeat()
+        Log.i(
+            TAG,
+            "READY mode=OWN_CGNAT fake=$FAKE_IP ap=${apAddr.hostAddress} " +
+                "→ PC: curl http://$FAKE_IP:3333  /  UDP $FAKE_IP:9999"
+        )
+        // 재시작하지 않음 — 앱/미러링 종료 시 VPN이 남으면 안 됨
+        return START_NOT_STICKY
     }
 
-    /**
-     * [결정 실험] FAKE_IP:9999에 UDP 소켓을 바인딩하고 수신을 로그.
-     * PC(핫스팟 클라이언트=차와 동일 경로)에서 203.0.113.7:9999로 프로브를 쏴서:
-     *  - "PROBE RECV" 로그 → addAddress 로컬배달 성립 → VpnService 게이트웨이 방식 유효.
-     *  - pump의 "rx" 로그 → 소켓 대신 tun으로 감(포트별 처리 차이).
-     *  - 둘 다 없음 → 포워딩 패킷이 앱에 안 옴 → 이 방식 폐기 판정.
-     */
-    private fun startProbeSocket() {
-        // 두 소켓으로 동시 판정: (A) 0.0.0.0:9999 no-protect, (B) FAKE_IP:9998 no-protect.
-        for ((tag, bindAddr, port) in listOf(
+    private fun startProbes() {
+        val ap = apAddr.hostAddress ?: "127.0.0.1"
+        val specs = listOf(
             Triple("A-wildcard", "0.0.0.0", 9999),
             Triple("B-fakeip", FAKE_IP, 9998),
-        )) {
+            Triple("C-ap", ap, 9997),
+        )
+        for ((tag, bindAddr, port) in specs) {
             Thread({
                 try {
                     val s = DatagramSocket(null)
@@ -82,45 +102,126 @@ class GatewayVpnService : VpnService() {
                     while (running) {
                         val p = DatagramPacket(b, b.size)
                         s.receive(p)
-                        Log.i(TAG, "PROBE RECV[$tag] ${p.length}B from ${p.address.hostAddress}:${p.port} → local delivery WORKS")
+                        Log.i(
+                            TAG,
+                            "PROBE RECV[$tag] ${p.length}B from ${p.address.hostAddress}:${p.port}"
+                        )
                     }
                 } catch (t: Throwable) {
-                    Log.e(TAG, "PROBE[$tag] error: ${t.message}")
+                    Log.w(TAG, "PROBE[$tag] fail ($bindAddr:$port): ${t.message}")
                 }
             }, "GatewayVpnProbe-$tag").start()
         }
     }
 
+    /** 상용 앱과 동일 포트 계열 TCP 수신 (HTTP 한 줄 응답). */
+    private fun startTcpProbe() {
+        Thread({
+            try {
+                // 0.0.0.0 과 FAKE_IP 둘 다 시도 — 어느 쪽이 바인드/수신되는지 판정
+                for ((tag, host) in listOf("T-wildcard" to "0.0.0.0", "T-fakeip" to FAKE_IP)) {
+                    Thread({
+                        try {
+                            val ss = ServerSocket()
+                            ss.reuseAddress = true
+                            ss.bind(InetSocketAddress(InetAddress.getByName(host), TCP_PORT))
+                            Log.i(TAG, "TCP[$tag] listening $host:$TCP_PORT")
+                            while (running) {
+                                val sock = ss.accept()
+                                handleTcp(tag, sock)
+                            }
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "TCP[$tag] fail: ${t.message}")
+                        }
+                    }, "GatewayVpnTcp-$tag").start()
+                    Thread.sleep(50)
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "TCP setup: ${t.message}")
+            }
+        }, "GatewayVpnTcpBoot").start()
+    }
+
+    private fun handleTcp(tag: String, sock: Socket) {
+        val n = tcpCount.incrementAndGet()
+        val remote = "${sock.inetAddress.hostAddress}:${sock.port}"
+        Log.i(TAG, "TCP RECV[$tag] #$n from $remote SUCCESS_TCP")
+        try {
+            sock.soTimeout = 3000
+            val reader = BufferedReader(InputStreamReader(sock.getInputStream()))
+            val first = reader.readLine()
+            Log.i(TAG, "TCP[$tag] request: $first")
+            val body = "ok n=$n tag=$tag mode=OWN_CGNAT fake=$FAKE_IP\n"
+            val writer = OutputStreamWriter(sock.getOutputStream())
+            writer.write(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" +
+                    "Content-Length: ${body.toByteArray().size}\r\nConnection: close\r\n\r\n$body"
+            )
+            writer.flush()
+        } catch (t: Throwable) {
+            Log.w(TAG, "TCP[$tag] handle: ${t.message}")
+        } finally {
+            runCatching { sock.close() }
+        }
+    }
+
+    private fun startHeartbeat() {
+        heartbeatThread = Thread({
+            var n = 0
+            while (running) {
+                try { Thread.sleep(5000) } catch (_: InterruptedException) { break }
+                if (!running) break
+                n++
+                Log.i(
+                    TAG,
+                    "heartbeat #$n alive tunRx=${rxCount.get()} tcp=${tcpCount.get()} " +
+                        "ap=${apAddr.hostAddress} mode=OWN_CGNAT"
+                )
+            }
+        }, "GatewayVpnHb").also { it.start() }
+    }
+
     private fun establish(): Boolean = try {
+        // 상용 TeslaMirror 주장: 가상 IP를 폰이 소유 (100.99.9.9)
         tun = Builder()
-            .setSession("TeslaMirror")
+            .setSession("TeslaMirror-cgnat")
             .setMtu(MTU)
-            // ★ 실험: FAKE_IP를 소유(addAddress)하지 않고 라우트만 건다. 그러면 클라이언트가
-            // FAKE_IP로 보낸 패킷은 로컬 INPUT이 아니라 '포워딩' 대상 → 라우트 따라 tun으로.
-            .addAddress(TUN_ADDR, 32)    // tun 자체 주소(더미). FAKE_IP는 소유 안 함.
-            .addRoute(FAKE_IP, 32)       // → 차의 FAKE_IP 패킷을 포워딩→tun으로
+            .addAddress(FAKE_IP, 32)
+            .addRoute(FAKE_IP, 32)
             .setBlocking(true)
             .establish()
-        tun != null
+        val ok = tun != null
+        Log.i(TAG, "establish ok=$ok addAddress+addRoute $FAKE_IP/32 (OWN_CGNAT)")
+        ok
     } catch (t: Throwable) {
         Log.e(TAG, "establish failed", t); false
     }
 
-    /** tun 읽기 루프: 차 → FAKE_IP:P UDP를 로컬 libwebrtc(apAddr:P)로 릴레이. */
     private fun pump() {
         val fd = tun ?: return
         val input = FileInputStream(fd.fileDescriptor)
         val output = FileOutputStream(fd.fileDescriptor)
         val buf = ByteArray(MTU)
-        var rx = 0L
+        Log.i(TAG, "pump started")
         while (running) {
-            val n = try { input.read(buf) } catch (t: Throwable) { if (running) Log.w(TAG, "tun read", t); break }
+            val n = try { input.read(buf) } catch (t: Throwable) {
+                if (running) Log.w(TAG, "tun read: ${t.message}"); break
+            }
             if (n <= 0) continue
-            val dg = Ipv4Udp.parse(buf, n) ?: continue
+            val dg = Ipv4Udp.parse(buf, n)
+            if (dg == null) {
+                if (rxCount.get() == 0L && tcpCount.get() == 0L) {
+                    Log.i(TAG, "tun non-UDP first ${n}B proto=${if (n > 9) buf[9].toInt() and 0xFF else -1}")
+                }
+                continue
+            }
             if (dg.dstIp != fakeIpInt) continue
-            rx++
-            if (rx <= 3 || rx % 300 == 0L) {
-                Log.i(TAG, "rx #$rx ${Ipv4Udp.ipToString(dg.srcIp)}:${dg.srcPort} → $FAKE_IP:${dg.dstPort} (${dg.payload.size}B)")
+            val rx = rxCount.incrementAndGet()
+            if (rx <= 5 || rx % 100 == 0L) {
+                Log.i(
+                    TAG,
+                    "rx #$rx ${Ipv4Udp.ipToString(dg.srcIp)}:${dg.srcPort} → $FAKE_IP:${dg.dstPort} SUCCESS_TUN_INGRESS"
+                )
             }
             val key = "${dg.srcIp}:${dg.srcPort}:${dg.dstPort}"
             val relay = relays.getOrPut(key) {
@@ -128,20 +229,16 @@ class GatewayVpnService : VpnService() {
             }
             relay.sendToLocal(dg.payload)
         }
-        Log.i(TAG, "pump ended rx=$rx")
+        Log.i(TAG, "pump ended tunRx=${rxCount.get()}")
     }
 
-    /**
-     * 하나의 (차 소스 + 목적포트)에 대응하는 릴레이. 차→libwebrtc는 sendToLocal,
-     * libwebrtc→차는 리더 스레드가 tun에 src=FAKE_IP:dstPort로 재주입.
-     */
     private inner class RelaySocket(
         private val carIp: Int,
         private val carPort: Int,
-        private val dstPort: Int,          // = libwebrtc 사설 후보 포트(포트 보존 재작성 덕분)
+        private val dstPort: Int,
         private val tunOut: FileOutputStream,
     ) {
-        private val sock = DatagramSocket().also { protect(it) }   // VPN 우회(로컬 전송)
+        private val sock = DatagramSocket().also { protect(it) }
         private val rbuf = ByteArray(MTU)
         @Volatile private var alive = true
         private val target = InetSocketAddress(apAddr, dstPort)
@@ -166,16 +263,50 @@ class GatewayVpnService : VpnService() {
         fun close() { alive = false; runCatching { sock.close() } }
     }
 
-    override fun onDestroy() {
+    /** tun 닫기 + 스레드 정지. 시스템 VPN 아이콘이 남는 주원인 = tun fd 미해제. */
+    private fun teardown(reason: String) {
+        if (!running && tun == null) {
+            Log.i(TAG, "teardown($reason) already idle")
+            return
+        }
+        Log.i(TAG, "teardown($reason) tunRx=${rxCount.get()} tcp=${tcpCount.get()}")
         running = false
-        relays.values.forEach { it.close() }; relays.clear()
-        runCatching { tun?.close() }; tun = null
+        relays.values.forEach { it.close() }
+        relays.clear()
         runCatching { pumpThread?.interrupt() }
-        Log.i(TAG, "destroyed")
+        runCatching { heartbeatThread?.interrupt() }
+        pumpThread = null
+        heartbeatThread = null
+        // tun close = OS가 VPN 연결 해제 (아이콘/라우트 제거)
+        runCatching { tun?.close() }
+        tun = null
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 24) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION") stopForeground(true)
+            }
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // 최근앱에서 스와이프해도 FGS VPN이 남는 기기 있음 → 강제 해제
+        teardown("task-removed")
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
+    }
+
+    override fun onDestroy() {
+        teardown("destroy")
         super.onDestroy()
     }
 
-    override fun onRevoke() { stopSelf(); super.onRevoke() }
+    override fun onRevoke() {
+        // 사용자가 시스템 설정에서 VPN 끊을 때
+        teardown("revoke")
+        stopSelf()
+        super.onRevoke()
+    }
 
     private fun resolveApAddress(): InetAddress? = try {
         NetworkInterface.getNetworkInterfaces().toList()
@@ -186,7 +317,10 @@ class GatewayVpnService : VpnService() {
             }
             .flatMap { it.inetAddresses.toList() }
             .firstOrNull { !it.isLinkLocalAddress && it.hostAddress?.contains(':') == false }
-    } catch (_: Throwable) { null }
+            .also { Log.i(TAG, "resolveApAddress → ${it?.hostAddress ?: "NONE"}") }
+    } catch (t: Throwable) {
+        Log.w(TAG, "resolveApAddress: ${t.message}"); null
+    }
 
     private fun startForegroundNotif() {
         val nm = getSystemService(NotificationManager::class.java)
@@ -200,8 +334,8 @@ class GatewayVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val notif: Notification = Notification.Builder(this, CHANNEL)
-            .setContentTitle("TeslaMirror 게이트웨이")
-            .setContentText("테슬라 로컬 경로 활성화")
+            .setContentTitle("TeslaMirror 게이트웨이 (CGNAT probe)")
+            .setContentText("OWN $FAKE_IP — TCP :$TCP_PORT")
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentIntent(pi)
             .setOngoing(true)
@@ -212,10 +346,14 @@ class GatewayVpnService : VpnService() {
     companion object {
         private const val TAG = "GatewayVpn"
         const val ACTION_STOP = "com.example.teslamirror.vpn.STOP"
+        const val ACTION_PROBE = "com.example.teslamirror.vpn.PROBE"
 
-        // 뷰어에 광고할 가짜 공인 IP(TEST-NET-3, RFC5737). 사설 IP가 아니라 테슬라 필터 통과.
-        const val FAKE_IP = "203.0.113.7"
-        private const val TUN_ADDR = "10.99.99.2"   // tun 더미 주소(FAKE_IP는 소유 안 함)
+        /**
+         * 상용 hustmobile TeslaMirror Android 가상 IP (FAQ 공개).
+         * RFC6598 CGNAT — 테슬라 "사설 LAN" 필터(10/172.16/192.168) 밖일 수 있음.
+         */
+        const val FAKE_IP = "100.99.9.9"
+        private const val TCP_PORT = 3333
         private const val MTU = 1500
         private const val CHANNEL = "teslamirror_vpn"
         private const val NOTIF_ID = 42
@@ -224,10 +362,20 @@ class GatewayVpnService : VpnService() {
             context.startForegroundService(Intent(context, GatewayVpnService::class.java))
         }
 
-        fun stop(context: Context) {
-            context.startService(
-                Intent(context, GatewayVpnService::class.java).apply { action = ACTION_STOP }
+        fun startProbeOnly(context: Context) {
+            context.startForegroundService(
+                Intent(context, GatewayVpnService::class.java).apply { action = ACTION_PROBE }
             )
+        }
+
+        fun stop(context: Context) {
+            // startForegroundService로 보내야 이미 FGS인 서비스가 STOP을 받음
+            val i = Intent(context, GatewayVpnService::class.java).apply { action = ACTION_STOP }
+            try {
+                context.startForegroundService(i)
+            } catch (_: Throwable) {
+                context.startService(i)
+            }
         }
     }
 }

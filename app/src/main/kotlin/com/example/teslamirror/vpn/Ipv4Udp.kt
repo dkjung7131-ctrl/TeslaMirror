@@ -3,10 +3,9 @@ package com.example.teslamirror.vpn
 /**
  * 최소 IPv4 + UDP 파서/빌더 (tun 릴레이 전용).
  *
- * GatewayVpnService가 addAddress+addRoute로 소유한 가짜 공인 IP로 향하는 차의 UDP는
- * tun fd(L3 원시 IP 패킷)로 들어온다(실차 실측). 이를 파싱해 폰의 실제 libwebrtc 포트로
- * 릴레이하고, 응답을 다시 IPv4/UDP로 감싸(src=가짜IP) tun에 써 넣는다. 옵션 없는 표준 20B
- * IPv4 + 8B UDP만 다룬다.
+ * GatewayVpnService가 tun에서 읽은 L3 패킷을 파싱해 libwebrtc 포트로 릴레이하고,
+ * 응답을 src=가짜IP 로 다시 감싸 tun에 쓴다. 옵션 없는 표준 20B IPv4 + 8B UDP만 다룬다.
+ * (tun ingress 성립 여부는 ROUTE_ONLY 프로브로 검증 중 — 단정하지 말 것.)
  */
 object Ipv4Udp {
 

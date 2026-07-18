@@ -64,9 +64,8 @@ object RendezvousUpdater {
      * 주행 중 바뀔 수 있어, 워커가 기억하는 공인 IP를 신선하게 유지해야 한다).
      */
     suspend fun push(context: Context, ip: String): String? = withContext(Dispatchers.IO) {
-        // 디버그 빌드(.debug)는 등록하지 않는다 — 릴리스와 다른 ANDROID_ID로 워커에
-        // 중복/오등록되어 뷰어가 엉뚱한 deviceId를 물게 되는 것을 막는다.
-        if (context.packageName.endsWith(".debug")) return@withContext null
+        // debug/release 는 applicationId만 다르고 ANDROID_ID(deviceId)는 동일.
+        // debug도 등록해야 노트북 테스트 시 워커 루트 URL이 폰을 찾는다.
         val secret = secret(context)
         if (secret.isBlank()) return@withContext null
         val body = JSONObject()
