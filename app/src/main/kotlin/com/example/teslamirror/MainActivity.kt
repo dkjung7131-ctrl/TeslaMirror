@@ -424,7 +424,14 @@ fun HomeScreen() {
                 ) { Text("중지", fontSize = 22.sp, fontWeight = FontWeight.SemiBold) }
             }
             if (appStatus.isNotBlank()) {
-                Text(appStatus, fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    appStatus,
+                    fontSize = 16.sp,
+                    color = if (appStatus.startsWith("시작 실패"))
+                        MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    lineHeight = 22.sp
+                )
             }
         }
 

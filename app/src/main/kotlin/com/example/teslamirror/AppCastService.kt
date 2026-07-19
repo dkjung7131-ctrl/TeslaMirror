@@ -145,17 +145,25 @@ class AppCastService : Service() {
         // 네트워크/ADB 작업은 별도 스레드에서
         Thread {
             try {
+                Log.i(TAG, "starting webrtc+scrcpy pkg=$pkg internet=$internetPath")
                 rtc.start()
                 ctrl.start()
-                _isRunningFlow.value = true
-                _statusFlow.value = "실행 중 — 테슬라에서 접속하세요"
+                // Compose collectAsState 가 백그라운드 스레드 emit 을 놓치는 기기 있음 → 메인 스레드로
+                mainHandler.post {
+                    _isRunningFlow.value = true
+                    _statusFlow.value = "실행 중 — 아래 접속 URL을 브라우저에서 여세요"
+                }
                 registerReceiverSafely()
+                Log.i(TAG, "started OK")
             } catch (t: Throwable) {
                 Log.e(TAG, "start failed", t)
-                _statusFlow.value = "시작 실패: ${t.message}"
-                stopEverything(); stopSelf()
+                stopEverything(clearStatus = false)
+                mainHandler.post {
+                    _statusFlow.value = "시작 실패: ${t.message}"
+                }
+                stopSelf()
             }
-        }.apply { isDaemon = true }.start()
+        }.apply { isDaemon = true; name = "AppCastStart" }.start()
 
         return START_NOT_STICKY
     }
@@ -188,9 +196,9 @@ class AppCastService : Service() {
         } catch (_: Throwable) {}
     }
 
-    private fun stopEverything() {
+    private fun stopEverything(clearStatus: Boolean = true) {
         _isRunningFlow.value = false
-        _statusFlow.value = ""
+        if (clearStatus) _statusFlow.value = ""
         unregisterReceiverSafely()
         runCatching { controller?.stop() }
         runCatching { decoder?.stop() }

@@ -53,12 +53,12 @@ class ScrcpyController(
         val jar = context.assets.open(ASSET_NAME).use { it.readBytes() }
         adb.pushFile(jar, REMOTE_JAR)
 
-        // 2) 서버 구동.
-        // force-stop + am start 루프는 본화면에서 앱이 죽었다 살아나며 **화면 깜빡임**을 유발
-        // (카카오톡 등). scrcpy 4.x start_app 로 가상 디스플레이에만 1회 기동한다.
+        // 2) 서버 구동 + 가상 디스플레이에 앱 1회 기동.
+        // - start_app= 옵션은 이 scrcpy-server 빌드에 없음(Unknown option → 즉시 종료 → UI 깜빡).
+        // - am force-stop 은 본화면 앱까지 죽여 깜빡임 → 쓰지 않음.
+        // - "New display" 로그 1회만 am start --display (libadb는 shell 동시 2개 불가 → 같은 파이프).
         val scid = String.format(Locale.US, "%08x", Random.nextInt(1, Int.MAX_VALUE))
         val socketName = "localabstract:scrcpy_$scid"
-        // 비대응 앱도 가상 디스플레이에 뜨게 (본화면 force-stop 안 함)
         runCatching {
             adb.runCommand(
                 "settings put global force_resizable_activities 1; " +
@@ -67,10 +67,18 @@ class ScrcpyController(
         }
         val server = "CLASSPATH=$REMOTE_JAR app_process / com.genymobile.scrcpy.Server $SERVER_VERSION" +
             " scid=$scid log_level=info tunnel_forward=true audio=false control=true video=true" +
-            " new_display=${displayWidth}x${displayHeight}/$dpi video_codec=h264 max_fps=$maxFps" +
-            " start_app=$targetPackage"
-        // 서버 stdout만 로그. am force-stop/본화면 재시작 없음 → 깜빡임 방지.
-        val cmd = "$server 2>&1"
+            " new_display=${displayWidth}x${displayHeight}/$dpi video_codec=h264 max_fps=$maxFps"
+        // Android 16: --activity-new-task / --activity-clear-task 는 미지원(Unknown option).
+        // -f 0x10008000 = NEW_TASK|CLEAR_TASK. force-stop 없이 가상 디스플레이에만 1회 기동.
+        val cmd = "comp=\$(cmd package resolve-activity --brief $targetPackage 2>/dev/null | awk '/\\// {print; exit}'); " +
+            "if [ -z \"\$comp\" ]; then comp=\$(cmd package resolve-activity --brief $targetPackage 2>/dev/null | tail -1); fi; " +
+            "echo \"COMP=\$comp PKG=$targetPackage\"; " +
+            "started=0; $server 2>&1 | while IFS= read -r line; do echo \"\$line\"; " +
+            "case \"\$line\" in *\"New display:\"*) " +
+            "if [ \"\$started\" = 0 ]; then started=1; " +
+            "id=\$(echo \"\$line\" | grep -o 'id=[0-9]*' | cut -d= -f2); " +
+            "echo \"AMSTART[\$id,\$comp]:\$(am start --display \"\$id\" -n \"\$comp\" -f 0x10008000 2>&1)\"; " +
+            "fi ;; esac; done"
         Log.i(TAG, "start server scid=$scid pkg=$targetPackage")
         serverStream = adb.openStream("shell:$cmd")
 
