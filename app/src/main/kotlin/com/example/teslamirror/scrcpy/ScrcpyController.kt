@@ -53,31 +53,27 @@ class ScrcpyController(
         val jar = context.assets.open(ASSET_NAME).use { it.readBytes() }
         adb.pushFile(jar, REMOTE_JAR)
 
-        // 2) 서버 구동 — 앱 실행까지 **같은 셸 안에서** 처리한다.
-        //    libadb는 scrcpy 서버 shell 스트림과 동시에 다른 명령 스트림(shell/exec)을
-        //    못 연다("Stream closed"/행). 그래서 별도 am start 스트림 대신, 서버 출력을
-        //    파이프로 읽어 "New display: id=N"을 잡고 같은 셸에서 am start 한다(추가 스트림 0).
+        // 2) 서버 구동.
+        // force-stop + am start 루프는 본화면에서 앱이 죽었다 살아나며 **화면 깜빡임**을 유발
+        // (카카오톡 등). scrcpy 4.x start_app 로 가상 디스플레이에만 1회 기동한다.
         val scid = String.format(Locale.US, "%08x", Random.nextInt(1, Int.MAX_VALUE))
         val socketName = "localabstract:scrcpy_$scid"
+        // 비대응 앱도 가상 디스플레이에 뜨게 (본화면 force-stop 안 함)
+        runCatching {
+            adb.runCommand(
+                "settings put global force_resizable_activities 1; " +
+                    "settings put global enable_freeform_support 1"
+            )
+        }
         val server = "CLASSPATH=$REMOTE_JAR app_process / com.genymobile.scrcpy.Server $SERVER_VERSION" +
             " scid=$scid log_level=info tunnel_forward=true audio=false control=true video=true" +
-            " new_display=${displayWidth}x${displayHeight}/$dpi video_codec=h264 max_fps=$maxFps"
-        // comp: 대상 앱의 launcher 액티비티(패키지/컴포넌트). 서버 시작 전에 한 번 조회.
-        val cmd = "comp=\$(cmd package resolve-activity --brief $targetPackage 2>/dev/null | tail -1); " +
-            "echo \"COMP=\$comp\"; " +
-            // 비대응(resizeableActivity=false) 앱도 가상 디스플레이에 뜨게 강제(am start --display가
-            // 앱을 본화면으로 튕기는 문제 해결). 전역 설정이라 1회면 유지.
-            "settings put global force_resizable_activities 1 2>/dev/null; " +
-            "settings put global enable_freeform_support 1 2>/dev/null; " +
-            "$server 2>&1 | while IFS= read -r line; do echo \"\$line\"; " +
-            "case \"\$line\" in *\"New display:\"*) " +
-            "id=\$(echo \"\$line\" | grep -o 'id=[0-9]*' | cut -d= -f2); " +
-            "pkg=\${comp%%/*}; am force-stop \"\$pkg\"; " +
-            "echo \"AMSTART[\$id,\$comp]:\$(am start --display \"\$id\" --activity-clear-task --activity-new-task -n \"\$comp\" 2>&1)\" ;; " +
-            "esac; done"
+            " new_display=${displayWidth}x${displayHeight}/$dpi video_codec=h264 max_fps=$maxFps" +
+            " start_app=$targetPackage"
+        // 서버 stdout만 로그. am force-stop/본화면 재시작 없음 → 깜빡임 방지.
+        val cmd = "$server 2>&1"
+        Log.i(TAG, "start server scid=$scid pkg=$targetPackage")
         serverStream = adb.openStream("shell:$cmd")
 
-        // 서버 로그(파이프된 echo)를 읽어 진단 로그로 남긴다.
         logThread = Thread { readServerLog(adb, serverStream!!.openInputStream()) }.apply {
             isDaemon = true; start()
         }
