@@ -55,19 +55,26 @@ class AppCastService : Service() {
         val statusFlow: StateFlow<String> = _statusFlow.asStateFlow()
 
         fun start(context: Context, packageName: String, internetPath: Boolean = true) {
-            // 버튼이 즉시 빨간 "중지"로 바뀌게 — scrcpy 준비 전에 UI 선반영
             _isRunningFlow.value = true
             _statusFlow.value = "시작 중…"
+            Log.i(TAG, "start() requested pkg=$packageName internet=$internetPath")
             val i = Intent(context, AppCastService::class.java).apply {
                 putExtra(EXTRA_PACKAGE, packageName)
                 putExtra(EXTRA_INTERNET_PATH, internetPath)
             }
+            // Android 8+: 백그라운드 제한 시 예외 — 호출측 try/catch
             context.startForegroundService(i)
         }
 
         fun stop(context: Context) {
+            _isRunningFlow.value = false
+            _statusFlow.value = ""
             val i = Intent(context, AppCastService::class.java).apply { action = ACTION_STOP }
-            context.startService(i)
+            try {
+                context.startService(i)
+            } catch (_: Throwable) {
+                context.startForegroundService(i)
+            }
         }
     }
 
@@ -99,8 +106,12 @@ class AppCastService : Service() {
             stopEverything(); stopSelf(); return START_NOT_STICKY
         }
         val pkg = intent?.getStringExtra(EXTRA_PACKAGE)
-        if (pkg.isNullOrBlank()) { stopSelf(); return START_NOT_STICKY }
+        if (pkg.isNullOrBlank()) {
+            publishUi(running = false, status = "시작 실패: 앱 패키지가 비어 있습니다")
+            stopSelf(); return START_NOT_STICKY
+        }
         val internetPath = intent.getBooleanExtra(EXTRA_INTERNET_PATH, true)
+        Log.i(TAG, "onStartCommand pkg=$pkg internet=$internetPath")
 
         // 전체화면과 동일하게 시그널링(워커)에 시크릿 필요.
         if (!RendezvousUpdater.isConfigured(this)) {

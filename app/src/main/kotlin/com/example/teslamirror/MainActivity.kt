@@ -9,6 +9,7 @@ import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -90,6 +91,21 @@ fun HomeScreen() {
     var appMode by remember { mutableStateOf(false) }
     val appRunning by AppCastService.isRunningFlow.collectAsState()
     val appStatus by AppCastService.statusFlow.collectAsState()
+    // 버튼 표시 전용. 서비스 Flow 와 섞지 않음(실패 직후 false 로 되돌아가며 중지가 안 보이던 버그 수정).
+    // true = 빨간 중지, false = 앱 캐스트 시작. 실패해도 사용자가 중지를 한 번 볼 수 있게 유지 후 실패 문구 표시.
+    var appCastUiRunning by remember { mutableStateOf(false) }
+    LaunchedEffect(appStatus) {
+        if (appStatus.startsWith("시작 실패")) {
+            Toast.makeText(context, appStatus, Toast.LENGTH_LONG).show()
+            // 실패 시 2초 뒤 시작 버튼으로 (즉시 되돌리면 "안 바뀐다"처럼 보임)
+            delay(2000)
+            appCastUiRunning = false
+        }
+    }
+    // 서비스가 정상 종료(중지 버튼)되면 UI 도 맞춤
+    LaunchedEffect(appRunning) {
+        if (!appRunning && appStatus.isEmpty()) appCastUiRunning = false
+    }
 
     // 앱 모드용 상태
     val appPrefs = remember { context.getSharedPreferences("appcast", Context.MODE_PRIVATE) }
@@ -390,14 +406,19 @@ fun HomeScreen() {
                 }
             }
 
-            if (!appRunning) {
+            // 카카오맵 자동저장 그대로 시작해도 됨 (원인 아님).
+            Text(
+                "선택: ${appList.firstOrNull { it.packageName == selectedPkg }?.label ?: selectedPkg ?: "(없음)"}",
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (!appCastUiRunning) {
                 Button(
                     onClick = {
+                        val pkg = selectedPkg
                         when {
-                            selectedPkg == null ->
+                            pkg.isNullOrBlank() ->
                                 Toast.makeText(context, "앱을 선택하세요", Toast.LENGTH_SHORT).show()
-                            // 앱 모드는 인터넷 ICE(STUN) 경로라 핫스팟이 필수는 아니다.
-                            // (내장 ADB/scrcpy는 무선 디버깅 mDNS를 쓰므로 Wi-Fi/네트워크만 있으면 됨.)
                             !RendezvousUpdater.isConfigured(context) ->
                                 Toast.makeText(context, "공용 접속 주소 시크릿을 먼저 저장하세요", Toast.LENGTH_LONG).show()
                             else -> {
@@ -408,8 +429,15 @@ fun HomeScreen() {
                                 ) {
                                     notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 }
-                                // start() 안에서 isRunning=true 선반영 → 즉시 빨간 중지 버튼
-                                AppCastService.start(context, selectedPkg!!, internetPath)
+                                appCastUiRunning = true
+                                Log.i("MainActivity", "app cast start pkg=$pkg")
+                                try {
+                                    AppCastService.start(context, pkg, internetPath)
+                                } catch (t: Throwable) {
+                                    Log.e("MainActivity", "startForegroundService failed", t)
+                                    appCastUiRunning = false
+                                    Toast.makeText(context, "시작 실패: ${t.message}", Toast.LENGTH_LONG).show()
+                                }
                             }
                         }
                     },
@@ -418,7 +446,10 @@ fun HomeScreen() {
                 ) { Text("앱 캐스트 시작", fontSize = 22.sp, fontWeight = FontWeight.SemiBold) }
             } else {
                 Button(
-                    onClick = { AppCastService.stop(context) },
+                    onClick = {
+                        appCastUiRunning = false
+                        AppCastService.stop(context)
+                    },
                     modifier = Modifier.fillMaxWidth(),
                     contentPadding = PaddingValues(vertical = 18.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
