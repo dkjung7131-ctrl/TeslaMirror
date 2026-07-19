@@ -55,6 +55,9 @@ class AppCastService : Service() {
         val statusFlow: StateFlow<String> = _statusFlow.asStateFlow()
 
         fun start(context: Context, packageName: String, internetPath: Boolean = true) {
+            // 버튼이 즉시 빨간 "중지"로 바뀌게 — scrcpy 준비 전에 UI 선반영
+            _isRunningFlow.value = true
+            _statusFlow.value = "시작 중…"
             val i = Intent(context, AppCastService::class.java).apply {
                 putExtra(EXTRA_PACKAGE, packageName)
                 putExtra(EXTRA_INTERNET_PATH, internetPath)
@@ -101,19 +104,25 @@ class AppCastService : Service() {
 
         // 전체화면과 동일하게 시그널링(워커)에 시크릿 필요.
         if (!RendezvousUpdater.isConfigured(this)) {
-            _statusFlow.value = "공용 접속 주소 시크릿을 먼저 저장하세요"
+            publishUi(running = false, status = "시작 실패: 공용 접속 주소 시크릿을 먼저 저장하세요")
             stopSelf(); return START_NOT_STICKY
         }
 
-        startInForeground()
-        _statusFlow.value = "시작 중…"
+        // 이미 기동 중이면 중복 start 무시 (버튼 연타)
+        if (controller != null || webrtc != null) {
+            Log.i(TAG, "already starting/running — ignore duplicate start")
+            return START_STICKY
+        }
 
-        // 전송: 전체화면과 같은 워커+STUN+JPEG 데이터채널 (전체화면 코드는 안 건드림).
-        // 디코더를 먼저 만들고, 연결 시 캐시 JPEG flush + 키프레임 요청.
+        startInForeground()
+        // scrcpy 준비 전에 먼저 빨간 중지 버튼으로 (사용자는 "시작→중지" 전환을 기대함)
+        publishUi(running = true, status = "시작 중… (무선 디버깅/scrcpy 준비)")
+
+        // 전송: 전체화면과 같은 워커+STUN+JPEG 데이터채널.
         lateinit var dec: H264ToJpeg
         val rtc = AppWebRtcSession(
             context = this,
-            onStatus = { _statusFlow.value = it },
+            onStatus = { msg -> publishUi(running = true, status = msg) },
             onViewerMessage = { json -> handleInput(json) },
             onConnected = {
                 Log.i(TAG, "viewer connected — flush JPEG + request IDR")
@@ -139,33 +148,40 @@ class AppCastService : Service() {
             targetPackage = pkg,
             onConfig = { cfg -> dec.submitConfig(cfg) },
             onFrame = { data, key -> dec.submitFrame(data, key) },
-            onError = { msg -> Log.w(TAG, msg); _statusFlow.value = msg },
+            onError = { msg -> Log.w(TAG, msg); publishUi(running = true, status = msg) },
         ).also { controller = it }
 
-        // 네트워크/ADB 작업은 별도 스레드에서
         Thread {
             try {
                 Log.i(TAG, "starting webrtc+scrcpy pkg=$pkg internet=$internetPath")
                 rtc.start()
                 ctrl.start()
-                // Compose collectAsState 가 백그라운드 스레드 emit 을 놓치는 기기 있음 → 메인 스레드로
-                mainHandler.post {
-                    _isRunningFlow.value = true
-                    _statusFlow.value = "실행 중 — 아래 접속 URL을 브라우저에서 여세요"
-                }
+                publishUi(running = true, status = "실행 중 — 아래 접속 URL을 브라우저에서 여세요")
                 registerReceiverSafely()
                 Log.i(TAG, "started OK")
             } catch (t: Throwable) {
                 Log.e(TAG, "start failed", t)
+                // 실패 시 빨간 중지 → 다시 시작 버튼 + 실패 문구
                 stopEverything(clearStatus = false)
-                mainHandler.post {
-                    _statusFlow.value = "시작 실패: ${t.message}"
-                }
+                publishUi(running = false, status = "시작 실패: ${t.message}")
                 stopSelf()
             }
         }.apply { isDaemon = true; name = "AppCastStart" }.start()
 
-        return START_NOT_STICKY
+        return START_STICKY
+    }
+
+    /** UI StateFlow 는 항상 메인 스레드에서 갱신 (Compose 반영 보장). */
+    private fun publishUi(running: Boolean, status: String) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            _isRunningFlow.value = running
+            _statusFlow.value = status
+        } else {
+            mainHandler.post {
+                _isRunningFlow.value = running
+                _statusFlow.value = status
+            }
+        }
     }
 
     private fun handleInput(json: String) {
@@ -197,13 +213,21 @@ class AppCastService : Service() {
     }
 
     private fun stopEverything(clearStatus: Boolean = true) {
-        _isRunningFlow.value = false
-        if (clearStatus) _statusFlow.value = ""
         unregisterReceiverSafely()
         runCatching { controller?.stop() }
         runCatching { decoder?.stop() }
         runCatching { webrtc?.stop() }
         controller = null; decoder = null; webrtc = null
+        if (clearStatus) {
+            publishUi(running = false, status = "")
+        } else {
+            // running 만 false — status 는 호출측이 실패 문구로 덮어씀
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                _isRunningFlow.value = false
+            } else {
+                mainHandler.post { _isRunningFlow.value = false }
+            }
+        }
     }
 
     private fun registerReceiverSafely() {

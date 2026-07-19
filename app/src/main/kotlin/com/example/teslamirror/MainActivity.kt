@@ -408,6 +408,7 @@ fun HomeScreen() {
                                 ) {
                                     notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 }
+                                // start() 안에서 isRunning=true 선반영 → 즉시 빨간 중지 버튼
                                 AppCastService.start(context, selectedPkg!!, internetPath)
                             }
                         }
