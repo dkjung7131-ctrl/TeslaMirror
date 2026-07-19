@@ -161,7 +161,7 @@ fun HomeScreen() {
     LaunchedEffect(Unit) {
         while (true) {
             val cands = withContext(Dispatchers.IO) { localIpCandidates() }
-            ipText = formatViewerUrls(cands, webrtcMode = true, secretConfigured = regConfigured)
+            ipText = formatViewerUrls(context, secretConfigured = regConfigured)
             val hotspotIp = cands.firstOrNull { it.isHotspot }?.ip
             if (hotspotIp != null) {
                 RendezvousUpdater.pushIfChanged(context, hotspotIp)?.let { regStatus = it }
@@ -257,7 +257,7 @@ fun HomeScreen() {
                 context, result.resultCode, result.data!!, fps,
                 internetPath = internetPath,
             )
-            ipText = formatViewerUrls(localIpCandidates(), webrtcMode = !appMode, secretConfigured = regConfigured)
+            ipText = formatViewerUrls(context, secretConfigured = regConfigured)
         }
     }
 
@@ -479,7 +479,7 @@ fun HomeScreen() {
             }
         }
 
-        if (!appMode) {
+        // 전체화면·앱 모드 공통: 노트북 실차 대용 테스트는 반드시 ON
         Card {
             Row(
                 modifier = Modifier
@@ -491,7 +491,7 @@ fun HomeScreen() {
                 Column(modifier = Modifier.weight(1f)) {
                     Text("테슬라 동일 경로 (공인만)", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "ON=사설 후보 제거·STUN 공인만(핫스팟 노트북=테슬라와 동일 조건). OFF=사설만(로컬 디버그, 테슬라 불가).",
+                        "ON=STUN 공인만(노트북 핫스팟=테슬라와 동일). OFF=사설만(로컬 디버그).",
                         fontSize = 13.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         lineHeight = 17.sp
@@ -500,10 +500,12 @@ fun HomeScreen() {
                 Switch(
                     checked = internetPath,
                     onCheckedChange = { internetPath = it },
-                    enabled = !running
+                    enabled = !running && !appRunning
                 )
             }
         }
+
+        if (!appMode) {
         if (!running) {
             Button(
                 onClick = {
@@ -640,11 +642,11 @@ fun HomeScreen() {
 
 internal data class IpCandidate(val ip: String, val isHotspot: Boolean)
 
-private fun formatViewerUrls(cands: List<IpCandidate>, webrtcMode: Boolean, secretConfigured: Boolean): String {
-    // 전체화면·앱 모드 **둘 다** 공용 워커 뷰어를 사용한다(테슬라 사설 IP 차단 + 앱 모드도
-    // WebRTC/STUN 경로로 전환됨). 로컬 IP:8080 서버는 더 이상 안 쓴다.
-    return if (secretConfigured) RendezvousUpdater.WORKER_URL
-    else "먼저 아래 '공용 접속 주소'에 시크릿을 저장하세요"
+private fun formatViewerUrls(context: android.content.Context, secretConfigured: Boolean): String {
+    // 전체화면·앱 모드 모두 워커 뷰어. deviceId 포함 URL을 보여 잘못된 폰/구 URL 접속을 막음.
+    if (!secretConfigured) return "먼저 아래 '공용 접속 주소'에 시크릿을 저장하세요"
+    val id = RendezvousUpdater.deviceId(context)
+    return "${RendezvousUpdater.WORKER_URL}/?id=$id"
 }
 
 /**

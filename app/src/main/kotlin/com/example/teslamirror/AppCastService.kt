@@ -109,16 +109,21 @@ class AppCastService : Service() {
         _statusFlow.value = "시작 중…"
 
         // 전송: 전체화면과 같은 워커+STUN+JPEG 데이터채널 (전체화면 코드는 안 건드림).
+        // 디코더를 먼저 만들고, 연결 시 캐시 JPEG flush + 키프레임 요청.
+        lateinit var dec: H264ToJpeg
         val rtc = AppWebRtcSession(
             context = this,
             onStatus = { _statusFlow.value = it },
-            onViewerMessage = { json -> handleInput(json) },   // Phase 2 터치 역제어
-            onConnected = { controller?.sendControl(ScrcpyProtocol.resetVideo()) }, // 새 뷰어에 키프레임
-            internetPath = internetPath,                        // ON=테슬라(공인 ICE), OFF=로컬 host(데스크)
+            onViewerMessage = { json -> handleInput(json) },
+            onConnected = {
+                Log.i(TAG, "viewer connected — flush JPEG + request IDR")
+                dec.flushLastJpeg()
+                controller?.sendControl(ScrcpyProtocol.resetVideo())
+            },
+            internetPath = internetPath,
         ).also { webrtc = it }
 
-        // scrcpy H.264 → 디코드 → JPEG → 데이터채널. 뷰어가 못 받을 땐 인코딩 스킵.
-        val dec = H264ToJpeg(
+        dec = H264ToJpeg(
             width = DISPLAY_WIDTH,
             height = DISPLAY_HEIGHT,
             shouldEncode = { rtc.canSend() },
