@@ -9,6 +9,7 @@ import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -30,8 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.teslamirror.adb.AdbManager
-import com.example.teslamirror.apps.AppEntry
-import com.example.teslamirror.apps.installedLaunchableApps
+import com.example.teslamirror.input.ImeWatchService
 import com.example.teslamirror.rendezvous.RendezvousUpdater
 import com.example.teslamirror.update.UpdateChecker
 import com.example.teslamirror.vpn.GatewayVpnService
@@ -107,20 +107,52 @@ fun HomeScreen() {
         if (!appRunning && appStatus.isEmpty()) appCastUiRunning = false
     }
 
-    // 앱 모드용 상태
-    val appPrefs = remember { context.getSharedPreferences("appcast", Context.MODE_PRIVATE) }
-    var appList by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
-    var selectedPkg by remember { mutableStateOf(appPrefs.getString("pkg", null)) }
-    var appMenuOpen by remember { mutableStateOf(false) }
+    // 앱 모드용 ADB: 이미 페어링됐으면 자동 연결. 포트/코드는 최초 1회만.
+    val adbPrefs = remember { context.getSharedPreferences("adb_pair", Context.MODE_PRIVATE) }
     var adbConnected by remember { mutableStateOf(false) }
+    var adbChecking by remember { mutableStateOf(false) }
+    var adbStatusText by remember { mutableStateOf("") }
+    var showPairForm by remember { mutableStateOf(false) }
     var pairing by remember { mutableStateOf(false) }
     var pairPort by remember { mutableStateOf("") }
     var pairCode by remember { mutableStateOf("") }
 
-    // 앱 모드 진입 시 설치 앱 목록 로드
+    fun tryAdbAutoConnect(fromUser: Boolean = false) {
+        if (adbChecking || pairing) return
+        adbChecking = true
+        adbStatusText = "무선 디버깅 연결 중…"
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    AdbManager.getInstance(context).ensureConnected(context)
+                }.getOrDefault(false)
+            }
+            adbChecking = false
+            adbConnected = ok
+            if (ok) {
+                adbPrefs.edit().putBoolean("paired_once", true).apply()
+                adbStatusText = "무선 디버깅 연결됨 (코드 재입력 불필요)"
+                showPairForm = false
+                if (fromUser) {
+                    Toast.makeText(context, "ADB 연결됨", Toast.LENGTH_SHORT).show()
+                }
+            } else {
+                val once = adbPrefs.getBoolean("paired_once", false)
+                adbStatusText = if (once) {
+                    "자동 연결 실패 — 설정에서 「무선 디버깅」이 켜져 있는지 확인"
+                } else {
+                    "최초 1회 페어링이 필요합니다"
+                }
+                // 실패 시에만 입력란 노출 (매번 강제 입력 아님)
+                showPairForm = true
+            }
+        }
+    }
+
+    // 앱 모드 진입 시 자동 연결 시도 (이미 페어링된 키로 mDNS 접속)
     LaunchedEffect(appMode) {
-        if (appMode && appList.isEmpty()) {
-            appList = withContext(Dispatchers.IO) { installedLaunchableApps(context) }
+        if (appMode && !adbConnected && !adbChecking) {
+            tryAdbAutoConnect(fromUser = false)
         }
     }
 
@@ -130,6 +162,7 @@ fun HomeScreen() {
             Toast.makeText(context, "포트와 6자리 코드를 확인하세요", Toast.LENGTH_SHORT).show(); return
         }
         pairing = true
+        adbStatusText = "페어링 중…"
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
@@ -141,12 +174,22 @@ fun HomeScreen() {
             pairing = false
             result.onSuccess { ok ->
                 adbConnected = ok
-                Toast.makeText(
-                    context,
-                    if (ok) "페어링 + 연결 완료" else "페어링됐지만 연결 실패 — 무선 디버깅이 켜져 있는지 확인",
-                    Toast.LENGTH_LONG
-                ).show()
+                if (ok) {
+                    adbPrefs.edit().putBoolean("paired_once", true).apply()
+                    showPairForm = false
+                    pairCode = ""
+                    adbStatusText = "페어링 완료 — 이제 코드 없이 자동 연결됩니다"
+                    Toast.makeText(context, "페어링 + 연결 완료", Toast.LENGTH_LONG).show()
+                } else {
+                    adbStatusText = "페어링됐지만 연결 실패 — 무선 디버깅 ON 확인"
+                    Toast.makeText(
+                        context,
+                        "페어링됐지만 연결 실패 — 무선 디버깅이 켜져 있는지 확인",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }.onFailure {
+                adbStatusText = "페어링 실패: ${it.message}"
                 Toast.makeText(context, "페어링 실패: ${it.message}", Toast.LENGTH_LONG).show()
             }
         }
@@ -173,14 +216,15 @@ fun HomeScreen() {
     }
 
     // 접속 URL을 2초마다 실시간 갱신 — Wi-Fi/핫스팟을 켜고 끄면 화면이 바로 따라감.
-    // 핫스팟 IP가 바뀌면 접선 서버(Cloudflare Worker)에도 여기서 자동 등록한다.
+    // 로컬 IP가 있으면 접선 서버에 등록(공인 ICE용 공인IP 매칭 + 로컬 디버그용 사설IP 기록).
     LaunchedEffect(Unit) {
         while (true) {
             val cands = withContext(Dispatchers.IO) { localIpCandidates() }
             ipText = formatViewerUrls(context, secretConfigured = regConfigured)
-            val hotspotIp = cands.firstOrNull { it.isHotspot }?.ip
-            if (hotspotIp != null) {
-                RendezvousUpdater.pushIfChanged(context, hotspotIp)?.let { regStatus = it }
+            // 핫스팟 우선, 없으면 집 Wi-Fi(wlan) IP로도 등록 — 인터넷 ICE면 핫스팟 불필요
+            val regIp = cands.firstOrNull { it.isHotspot }?.ip ?: cands.firstOrNull()?.ip
+            if (regIp != null) {
+                RendezvousUpdater.pushIfChanged(context, regIp)?.let { regStatus = it }
             }
             delay(2000)
         }
@@ -334,24 +378,72 @@ fun HomeScreen() {
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     RadioButton(selected = appMode, onClick = { appMode = true }, enabled = !anyRunning)
-                    Text("앱 모드 (선택한 앱만, 테슬라 해상도)", fontSize = 18.sp)
+                    Text("앱 모드 (홈 런처 → 내비 등 선택)", fontSize = 18.sp)
                 }
             }
         }
 
         // ── 앱 모드 UI ──
         if (appMode) {
-            if (!adbConnected) {
-                Card {
-                    Column(
-                        Modifier.padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text("무선 디버깅 페어링", fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+            Card {
+                Column(
+                    Modifier.padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("무선 디버깅", fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (adbConnected) adbStatusText
+                        else if (adbChecking || pairing) adbStatusText.ifBlank { "연결 중…" }
+                        else adbStatusText.ifBlank { "연결 상태 확인 중…" },
+                        fontSize = 15.sp,
+                        lineHeight = 22.sp,
+                        color = if (adbConnected) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (adbConnected) {
                         Text(
-                            "설정 → 개발자 옵션 → 무선 디버깅 → \"페어링 코드로 기기 페어링\"에 뜨는 " +
-                                "포트와 6자리 코드를 입력하세요. (최초 1회, 재설치 전까지 유지)",
-                            fontSize = 15.sp, lineHeight = 22.sp
+                            "포트·코드는 설정 화면을 열 때마다 바뀌지만, 한 번 페어링하면 앱이 기억합니다. " +
+                                "평소에는 「무선 디버깅」만 켜 두면 됩니다.",
+                            fontSize = 14.sp,
+                            lineHeight = 20.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    // 설정 메뉴 점프 — 가능하면 분할 화면으로 (코드 보면서 입력)
+                    OutlinedButton(
+                        onClick = {
+                            // 페어링 입력란 미리 펼침 (분할 후 바로 입력)
+                            showPairForm = true
+                            if (!openWirelessDebuggingSettings(context)) {
+                                Toast.makeText(
+                                    context,
+                                    "설정 화면을 열 수 없습니다. 개발자 옵션 → 무선 디버깅을 직접 열어 주세요",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            } else {
+                                Toast.makeText(
+                                    context,
+                                    "설정이 옆에 열리면 포트·코드를 이 앱에 입력하세요. 안 열리면 최근 앱에서 분할 화면을 켜 보세요.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("무선 디버깅 설정 열기 (분할 시도)", fontSize = 16.sp) }
+                    if (!adbConnected && !adbChecking) {
+                        Button(
+                            onClick = { tryAdbAutoConnect(fromUser = true) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("다시 연결 시도", fontSize = 17.sp) }
+                    }
+                    // 자동 연결 실패 또는 사용자가 펼친 경우에만 최초 페어링 폼
+                    if (showPairForm && !adbConnected) {
+                        Text(
+                            "최초 1회만 · 「무선 디버깅 설정 열기」→ 무선 디버깅 ON → " +
+                                "「페어링 코드로 기기 페어링」의 포트·6자리 코드 입력\n" +
+                                "(화면을 다시 열면 숫자가 바뀌는 게 정상 — 그때 보이는 걸 입력)",
+                            fontSize = 14.sp,
+                            lineHeight = 20.sp
                         )
                         OutlinedTextField(
                             value = pairPort, onValueChange = { pairPort = it },
@@ -365,62 +457,86 @@ fun HomeScreen() {
                         )
                         Button(
                             onClick = { pairAdb() },
-                            enabled = !pairing,
+                            enabled = !pairing && !adbChecking,
                             modifier = Modifier.fillMaxWidth()
                         ) { Text(if (pairing) "페어링 중…" else "페어링", fontSize = 18.sp) }
-                    }
-                }
-            }
-
-            Card {
-                Column(
-                    Modifier.padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text("캐스트할 앱", fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-                    val selectedLabel = appList.firstOrNull { it.packageName == selectedPkg }?.label
-                        ?: selectedPkg ?: "앱을 선택하세요"
-                    Box {
-                        OutlinedButton(
-                            onClick = { appMenuOpen = true },
-                            enabled = !appRunning,
-                            modifier = Modifier.fillMaxWidth()
-                        ) { Text(selectedLabel, fontSize = 18.sp) }
-                        DropdownMenu(
-                            expanded = appMenuOpen,
-                            onDismissRequest = { appMenuOpen = false },
-                            modifier = Modifier.heightIn(max = 360.dp)
-                        ) {
-                            appList.forEach { app ->
-                                DropdownMenuItem(
-                                    text = { Text(app.label) },
-                                    onClick = {
-                                        selectedPkg = app.packageName
-                                        appPrefs.edit().putString("pkg", app.packageName).apply()
-                                        appMenuOpen = false
-                                    }
-                                )
-                            }
+                    } else if (!adbConnected && !showPairForm && !adbChecking) {
+                        TextButton(onClick = { showPairForm = true }) {
+                            Text("최초 페어링이 필요하면 여기", fontSize = 14.sp)
                         }
                     }
                 }
             }
 
-            // 카카오맵 자동저장 그대로 시작해도 됨 (원인 아님).
             Text(
-                "선택: ${appList.firstOrNull { it.packageName == selectedPkg }?.label ?: selectedPkg ?: "(없음)"}",
-                fontSize = 14.sp,
+                "시작 시 홈(런처)이 뜹니다. T맵·카카오맵 등이 설치돼 있으면 위에 먼저 보이고, 없으면 표시 안 됩니다.",
+                fontSize = 15.sp,
+                lineHeight = 22.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            // 테슬라 화면에 여백 없이 맞추기 (뷰어 비율 학습 → 다음 시작에 반영)
+            var fillTesla by remember {
+                mutableStateOf(AppCastDisplayPrefs.isFillEnabled(context))
+            }
+            var displaySummary by remember {
+                mutableStateOf(AppCastDisplayPrefs.summaryLabel(context))
+            }
+            fun refreshDisplaySummary() {
+                displaySummary = AppCastDisplayPrefs.summaryLabel(context)
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Checkbox(
+                    checked = fillTesla,
+                    onCheckedChange = {
+                        fillTesla = it
+                        AppCastDisplayPrefs.setFillEnabled(context, it)
+                        refreshDisplaySummary()
+                    },
+                    enabled = !appCastUiRunning
+                )
+                Column(Modifier.weight(1f)) {
+                    Text("테슬라 화면 꽉 채우기", fontSize = 17.sp, fontWeight = FontWeight.Medium)
+                    Text(
+                        if (fillTesla) {
+                            "ON · $displaySummary\n접속 후 비율 기억 → 다음 캐스트부터 적용. 여백이 이상하면 초기화"
+                        } else {
+                            "OFF · 고정 ${AppCastDisplayPrefs.DEFAULT_W}×${AppCastDisplayPrefs.DEFAULT_H}"
+                        },
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (fillTesla && AppCastDisplayPrefs.hasViewport(context)) {
+                        TextButton(
+                            onClick = {
+                                AppCastDisplayPrefs.clearViewport(context)
+                                refreshDisplaySummary()
+                                Toast.makeText(context, "학습 비율 초기화 → 다음엔 1280×800", Toast.LENGTH_SHORT).show()
+                            },
+                            enabled = !appCastUiRunning
+                        ) { Text("학습 비율 초기화", fontSize = 13.sp) }
+                    }
+                }
+            }
             if (!appCastUiRunning) {
                 Button(
                     onClick = {
-                        val pkg = selectedPkg
                         when {
-                            pkg.isNullOrBlank() ->
-                                Toast.makeText(context, "앱을 선택하세요", Toast.LENGTH_SHORT).show()
                             !RendezvousUpdater.isConfigured(context) ->
                                 Toast.makeText(context, "공용 접속 주소 시크릿을 먼저 저장하세요", Toast.LENGTH_LONG).show()
+                            adbChecking || pairing ->
+                                Toast.makeText(context, "무선 디버깅 연결이 끝날 때까지 잠시만요", Toast.LENGTH_SHORT).show()
+                            !adbConnected -> {
+                                Toast.makeText(
+                                    context,
+                                    "무선 디버깅 연결 필요 — 위 「다시 연결」또는 최초 페어링",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                tryAdbAutoConnect(fromUser = true)
+                            }
                             else -> {
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                                     ContextCompat.checkSelfPermission(
@@ -429,10 +545,13 @@ fun HomeScreen() {
                                 ) {
                                     notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 }
+                                if (!ImeWatchService.isEnabled(context)) {
+                                    Log.i("MainActivity", "ImeWatch not enabled — cast without auto-IME")
+                                }
                                 appCastUiRunning = true
-                                Log.i("MainActivity", "app cast start pkg=$pkg")
+                                Log.i("MainActivity", "app cast start launcher")
                                 try {
-                                    AppCastService.start(context, pkg, internetPath)
+                                    AppCastService.start(context, internetPath)
                                 } catch (t: Throwable) {
                                     Log.e("MainActivity", "startForegroundService failed", t)
                                     appCastUiRunning = false
@@ -442,7 +561,8 @@ fun HomeScreen() {
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(vertical = 18.dp)
+                    contentPadding = PaddingValues(vertical = 18.dp),
+                    enabled = !adbChecking && !pairing
                 ) { Text("앱 캐스트 시작", fontSize = 22.sp, fontWeight = FontWeight.SemiBold) }
             } else {
                 Button(
@@ -554,10 +674,11 @@ fun HomeScreen() {
                             "공용 접속 주소 시크릿을 먼저 저장하세요 (아래 카드)",
                             Toast.LENGTH_LONG
                         ).show()
-                    } else if (!isHotspotEnabled(context)) {
+                    } else if (!internetPath && !isHotspotEnabled(context)) {
+                        // 로컬(사설) ICE만 핫스팟/동일 LAN 필요. 인터넷 ICE(테슬라 경로)는 불필요.
                         Toast.makeText(
                             context,
-                            "핫스팟을 먼저 켜주세요",
+                            "로컬 경로(인터넷 ICE 끔)는 핫스팟을 먼저 켜주세요",
                             Toast.LENGTH_LONG
                         ).show()
                     } else {
@@ -682,10 +803,70 @@ fun HomeScreen() {
 internal data class IpCandidate(val ip: String, val isHotspot: Boolean)
 
 private fun formatViewerUrls(context: android.content.Context, secretConfigured: Boolean): String {
-    // 전체화면·앱 모드 모두 워커 뷰어. deviceId 포함 URL을 보여 잘못된 폰/구 URL 접속을 막음.
+    // 평소에는 짧은 URL만 쓰면 됨(워커가 등록된 폰 자동 선택).
+    // id= 는 폰이 여러 대이거나 자동 선택이 안 될 때만 필요.
     if (!secretConfigured) return "먼저 아래 '공용 접속 주소'에 시크릿을 저장하세요"
     val id = RendezvousUpdater.deviceId(context)
-    return "${RendezvousUpdater.WORKER_URL}/?id=$id"
+    return RendezvousUpdater.WORKER_URL +
+        "\n\n(자동 선택이 안 될 때만)\n${RendezvousUpdater.WORKER_URL}/?id=$id"
+}
+
+/**
+ * 무선 디버깅 설정 화면으로 점프.
+ * 1) 분할 화면(LAUNCH_ADJACENT) 시도 — 페어링 코드 보면서 이 앱에 입력 가능
+ * 2) 실패 시 일반 전체화면
+ * 팝업/플로팅 창은 공개 API가 없어 기기마다 달라 보장 불가.
+ * 페어링 코드 팝업까지 직접 여는 API도 없음.
+ */
+private fun openWirelessDebuggingSettings(context: Context): Boolean {
+    val attempts = buildList {
+        add(Intent("android.settings.ADB_WIRELESS_SETTINGS"))
+        add(
+            Intent().setClassName(
+                "com.android.settings",
+                "com.android.settings.development.WirelessDebuggingActivity"
+            )
+        )
+        add(
+            Intent().setClassName(
+                "com.android.settings",
+                "com.android.settings.Settings\$WirelessDebuggingActivity"
+            )
+        )
+        add(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+    }
+    for (raw in attempts) {
+        // 분할 화면 우선 (N+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            val split = Intent(raw).apply {
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_MULTIPLE_TASK or
+                        Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT
+                )
+            }
+            if (tryStartSettings(context, split, "split")) return true
+        }
+        val full = Intent(raw).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (tryStartSettings(context, full, "full")) return true
+    }
+    return false
+}
+
+private fun tryStartSettings(context: Context, intent: Intent, mode: String): Boolean {
+    val resolved = intent.resolveActivity(context.packageManager) != null ||
+        intent.component != null
+    if (!resolved && intent.component == null) {
+        // action-only: resolve 실패하면 스킵
+        if (intent.action != null && intent.resolveActivity(context.packageManager) == null) {
+            return false
+        }
+    }
+    return runCatching {
+        context.startActivity(intent)
+        Log.i("MainActivity", "opened settings mode=$mode via ${intent.action ?: intent.component}")
+        true
+    }.getOrDefault(false)
 }
 
 /**

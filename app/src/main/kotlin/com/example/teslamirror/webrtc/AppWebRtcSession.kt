@@ -93,6 +93,25 @@ class AppWebRtcSession(
         }
     }
 
+    /**
+     * 뷰어로 제어 JSON.
+     * binary=true 로 보냄 — 일부 브라우저/조합에서 text 프레임이 JPEG 폭주 때 묻히거나
+     * onmessage 타입이 달라 파싱이 스킵되는 경우가 있어, 작은 binary 로 통일.
+     * (뷰어는 payload 선두 '{' 로 JPEG 와 구분)
+     */
+    fun pushControlJson(json: String) {
+        val dc = dataChannel ?: return
+        try {
+            if (dc.state() != DataChannel.State.OPEN) return
+            val bytes = json.toByteArray(Charsets.UTF_8)
+            val ok = dc.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), /* binary */ true))
+            if (!ok) Log.w(TAG, "dc control send returned false len=${bytes.size}")
+            else Log.i(TAG, "dc control sent ${bytes.size}B ${json.take(60)}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "dc control send failed", t)
+        }
+    }
+
     private fun initFactory() {
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
@@ -113,8 +132,14 @@ class AppWebRtcSession(
                 val answer = awaitAnswer(offerId)
                 if (answer == null) { closeConnection(); continue }
                 setRemote(answer)
-                val ok = withTimeoutOrNull(12_000) { connected.await() } != null
-                if (!ok) { Log.i(TAG, "not connected in 12s, re-offering"); closeConnection(); continue }
+                // 너무 길면 뷰어가 옛 offer에 묶인 채 "연결 중" 고착. 18s면 STUN 여유 있음.
+                val waitMs = if (internetPath) 18_000L else 12_000L
+                onStatus("ICE 연결 중…")
+                val ok = withTimeoutOrNull(waitMs) { connected.await() } != null
+                if (!ok) {
+                    Log.i(TAG, "not connected in ${waitMs}ms, re-offering state=${pc?.connectionState()}")
+                    closeConnection(); continue
+                }
                 onStatus("연결됨")
                 runCatching { onConnected() }   // 새 뷰어용 키프레임 요청 등
                 awaitClosed()
@@ -123,7 +148,8 @@ class AppWebRtcSession(
             } finally {
                 closeConnection()
             }
-            if (running) delay(500)
+            // 재협상 간격 (너무 짧으면 깜빡임, 너무 길면 "연결중" 체감↑)
+            if (running) delay(800)
         }
     }
 
@@ -138,6 +164,8 @@ class AppWebRtcSession(
         ) else emptyList()
         val cfg = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            // offer 전 후보 미리 모아 첫 접속 지연 감소
+            if (internetPath) iceCandidatePoolSize = 4
         }
         pc = factory.createPeerConnection(cfg, object : PeerConnection.Observer {
             override fun onIceCandidate(candidate: IceCandidate?) {}
@@ -147,10 +175,16 @@ class AppWebRtcSession(
             override fun onConnectionChange(s: PeerConnection.PeerConnectionState?) {
                 Log.i(TAG, "pc=$s")
                 when (s) {
-                    PeerConnection.PeerConnectionState.CONNECTED -> c.complete(Unit)
+                    PeerConnection.PeerConnectionState.CONNECTED -> {
+                        // 일시 disconnected 후 복구 가능 — 세션 종료로 보지 않음
+                        if (!c.isCompleted) c.complete(Unit)
+                    }
+                    // DISCONNECTED 는 ICE 일시 끊김(수 초 복구 흔함). 여기서 끝내면
+                    // 폰이 바로 re-offer → 뷰어가 연결중/재연결중 깜빡임.
                     PeerConnection.PeerConnectionState.FAILED,
-                    PeerConnection.PeerConnectionState.DISCONNECTED,
-                    PeerConnection.PeerConnectionState.CLOSED -> x.complete(Unit)
+                    PeerConnection.PeerConnectionState.CLOSED -> {
+                        if (!x.isCompleted) x.complete(Unit)
+                    }
                     else -> {}
                 }
             }
@@ -167,13 +201,26 @@ class AppWebRtcSession(
         val dc = pc!!.createDataChannel("v", DataChannel.Init().apply { ordered = true })
         dc.registerObserver(object : DataChannel.Observer {
             override fun onBufferedAmountChange(previousAmount: Long) {}
-            override fun onStateChange() {}
+            override fun onStateChange() {
+                val st = runCatching { dc.state() }.getOrNull()
+                Log.i(TAG, "dc=$st")
+                // 뷰어(브라우저) 종료 시 DC 먼저 닫힘 → 즉시 re-offer (옛 offer에 새 뷰어 붙는 고착 방지)
+                if (st == DataChannel.State.CLOSED || st == DataChannel.State.CLOSING) {
+                    if (c.isCompleted && !x.isCompleted) x.complete(Unit)
+                }
+            }
             override fun onMessage(buffer: DataChannel.Buffer?) {
-                // 뷰어→폰 역방향 메시지(Phase 2 터치). 바이너리(우리 JPEG)는 무시, 텍스트만.
+                // 뷰어→폰 JSON 제어. 브라우저는 string 또는 binary UTF-8 로 보낼 수 있음.
                 val b = buffer ?: return
-                if (b.binary) return
                 val data = ByteArray(b.data.remaining()).also { b.data.get(it) }
-                runCatching { onViewerMessage(String(data, Charsets.UTF_8)) }
+                val s = runCatching { String(data, Charsets.UTF_8) }.getOrNull() ?: return
+                if (!s.startsWith("{")) {
+                    Log.w(TAG, "viewer msg ignored binary=${b.binary} len=${data.size}")
+                    return
+                }
+                Log.i(TAG, "viewer msg binary=${b.binary} ${s.take(80)}")
+                runCatching { onViewerMessage(s) }
+                    .onFailure { Log.w(TAG, "viewer msg handle failed", it) }
             }
         })
         dataChannel = dc
@@ -189,17 +236,35 @@ class AppWebRtcSession(
             }, MediaConstraints())
         }
         awaitSet("setLocal") { pc!!.setLocalDescription(it, offer) }
-        withTimeoutOrNull(5000) { gathered.await() }
+        // 전체 gather(최대 5s) 대신 유용 후보가 모이면 바로 offer 게시 → 첫 연결 체감 단축
+        waitForUsefulIce(internetPath)
         val raw = pc!!.localDescription?.description ?: offer.description
-        val filtered = if (internetPath) filterToPublicCandidates(raw) else filterToLocalCandidates(raw)
+        // internetPath: 사설 host + 공인 srflx 동시 (집 LAN + 테슬라). 루프백만 제거.
+        val filtered = if (internetPath) filterJunkCandidates(raw) else filterToLocalCandidates(raw)
         val hasCand = Regex("""a=candidate:""").containsMatchIn(filtered)
         if (!hasCand) {
             Log.w(TAG, "no candidate after filter internet=$internetPath — fallback raw")
-            onStatus(if (internetPath) "공인 ICE 후보 없음 — 셀룰러/STUN 확인" else "로컬 후보 없음 — 핫스팟 확인")
+            onStatus(if (internetPath) "ICE 후보 없음 — 네트워크 확인" else "로컬 후보 없음 — Wi-Fi/핫스팟 확인")
         }
         val sdp = if (hasCand) filtered else raw
         Log.i(TAG, "offer ready cands=${Regex("""a=candidate:""").findAll(sdp).count()} internet=$internetPath")
         return sdp
+    }
+
+    /** gather complete 또는 유용 후보( srflx / host ) 확보 시 조기 종료. 상한 ~1.8s */
+    private suspend fun waitForUsefulIce(internet: Boolean) {
+        val deadline = System.currentTimeMillis() + 1_800L
+        while (running && System.currentTimeMillis() < deadline) {
+            if (gathered.isCompleted) return
+            val sdp = pc?.localDescription?.description.orEmpty()
+            if (internet) {
+                if (sdp.contains("typ srflx") || sdp.contains("typ relay")) return
+            } else if (Regex("""a=candidate:.*typ host""").containsMatchIn(sdp)) {
+                return
+            }
+            delay(50)
+        }
+        withTimeoutOrNull(100) { if (!gathered.isCompleted) gathered.await() }
     }
 
     private fun filterToLocalCandidates(sdp: String): String =
@@ -209,11 +274,11 @@ class AppWebRtcSession(
             isPrivateIpv4(addr)
         }.joinToString("\r\n").trimEnd() + "\r\n"
 
-    private fun filterToPublicCandidates(sdp: String): String =
+    private fun filterJunkCandidates(sdp: String): String =
         sdp.split("\r\n", "\n").map { it.trimEnd('\r') }.filter { line ->
             if (!line.startsWith("a=candidate:")) return@filter true
             val addr = line.removePrefix("a=").split(' ').getOrNull(4) ?: return@filter false
-            !isPrivateIpv4(addr) && addr != "0.0.0.0"
+            addr != "0.0.0.0" && addr != "127.0.0.1" && !addr.startsWith("192.0.0.")
         }.joinToString("\r\n").trimEnd() + "\r\n"
 
     private fun isPrivateIpv4(a: String): Boolean {
@@ -240,12 +305,28 @@ class AppWebRtcSession(
     }
 
     private suspend fun awaitClosed() {
+        // DISCONNECTED 는 잠시 후 CONNECTED 로 돌아올 수 있음 → 즉시 종료하지 않음.
+        // FAILED/CLOSED 만 세션 끝. DISCONNECTED 가 오래 가면 별도 타임아웃.
+        var disconnectedSince = 0L
         while (running) {
             val st = pc?.connectionState() ?: return
-            if (st == PeerConnection.PeerConnectionState.FAILED ||
-                st == PeerConnection.PeerConnectionState.DISCONNECTED ||
-                st == PeerConnection.PeerConnectionState.CLOSED
-            ) return
+            when (st) {
+                PeerConnection.PeerConnectionState.FAILED,
+                PeerConnection.PeerConnectionState.CLOSED -> return
+                PeerConnection.PeerConnectionState.DISCONNECTED -> {
+                    if (disconnectedSince == 0L) disconnectedSince = System.currentTimeMillis()
+                    // STUN/집 Wi-Fi 에서 수 초 흔들림 허용
+                    if (System.currentTimeMillis() - disconnectedSince > 15_000L) {
+                        Log.i(TAG, "disconnected >15s, end session")
+                        return
+                    }
+                }
+                PeerConnection.PeerConnectionState.CONNECTED,
+                PeerConnection.PeerConnectionState.CONNECTING -> {
+                    disconnectedSince = 0L
+                }
+                else -> {}
+            }
             withTimeoutOrNull(2000) { closed.await() }
         }
     }
@@ -257,7 +338,12 @@ class AppWebRtcSession(
     }
 
     private suspend fun postOffer(offerId: String, sdp: String) {
-        val body = JSONObject().put("deviceId", deviceId).put("offerId", offerId).put("sdp", sdp).toString()
+        val body = JSONObject()
+            .put("deviceId", deviceId)
+            .put("offerId", offerId)
+            .put("sdp", sdp)
+            .put("mode", "app") // 뷰어: 앱 모드면 L/C/R 위치 버튼 숨김
+            .toString()
         runCatching { RendezvousUpdater.postJson(context, "/offer", body) }
     }
 
@@ -269,10 +355,11 @@ class AppWebRtcSession(
             val now = System.currentTimeMillis()
             if (now - lastRepost > 100_000) {
                 val d = pc?.localDescription?.description ?: return null
-                postOffer(offerId, if (internetPath) filterToPublicCandidates(d) else filterToLocalCandidates(d))
+                postOffer(offerId, if (internetPath) filterJunkCandidates(d) else filterToLocalCandidates(d))
                 lastRepost = now
             }
-            delay(if (now - start < 20_000) 700 else 2500)
+            // answer 폴링 빠르게 (워커 KV 무료 한도 대비 초반만 촘촘)
+            delay(if (now - start < 15_000) 300 else 1_000)
         }
         return null
     }

@@ -85,8 +85,10 @@ class ScreenCaptureService : Service() {
 
     private var scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var webRtcSession: WebRtcSession? = null
+    /** true면 공인 ICE — 핫스팟 없어도 유지 (테슬라/집 Wi-Fi 노트북 테스트). */
+    private var internetPathActive = true
 
-    // 안전장치: 6시간 강제 종료 + 네트워크 끊김 감지
+    // 안전장치: 6시간 강제 종료 + (로컬 경로일 때만) 핫스팟 끊김 감지
     private val mainHandler = Handler(Looper.getMainLooper())
     private var consecutiveNetFailures = 0
 
@@ -98,6 +100,8 @@ class ScreenCaptureService : Service() {
 
     private val networkCheckRunnable = object : Runnable {
         override fun run() {
+            // 인터넷 ICE는 핫스팟 불필요 — 집 Wi-Fi/셀룰러만으로도 유지
+            if (internetPathActive) return
             if (isHotspotEnabled(this@ScreenCaptureService)) {
                 consecutiveNetFailures = 0
             } else {
@@ -113,9 +117,10 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    // 즉시 반응: 안드로이드의 WIFI_AP_STATE_CHANGED 브로드캐스트
+    // 로컬 ICE 경로에서만: 핫스팟 꺼지면 즉시 종료
     private val hotspotStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            if (internetPathActive) return
             if (intent.action != ACTION_WIFI_AP_STATE) return
             val state = intent.getIntExtra("wifi_state", -1)
             if (state in HOTSPOT_OFF_STATES) {
@@ -163,12 +168,16 @@ class ScreenCaptureService : Service() {
             if (scope.coroutineContext[kotlinx.coroutines.Job]?.isActive != true) {
                 scope = CoroutineScope(Dispatchers.Default + SupervisorJob())  // 재시작 대비 재생성
             }
+            internetPathActive = internetPath
             startProjection(resultCode, data, fps, internetPath)
             _isRunningFlow.value = true
             mainHandler.postDelayed(autoStopRunnable, AUTO_STOP_MS)
             consecutiveNetFailures = 0
-            mainHandler.postDelayed(networkCheckRunnable, NET_CHECK_INITIAL_DELAY_MS)
-            registerHotspotReceiver()
+            // 로컬(사설) ICE만 핫스팟 감시. 인터넷 ICE는 핫스팟 없이 유지.
+            if (!internetPath) {
+                mainHandler.postDelayed(networkCheckRunnable, NET_CHECK_INITIAL_DELAY_MS)
+                registerHotspotReceiver()
+            }
             startPeriodicRendezvousRegistration()
         } catch (t: Throwable) {
             Log.e(TAG, "start failed", t)
@@ -210,8 +219,10 @@ class ScreenCaptureService : Service() {
         if (!RendezvousUpdater.isConfigured(this)) return
         scope.launch {
             while (isActive) {
-                localIpCandidates().firstOrNull { it.isHotspot }?.let {
-                    RendezvousUpdater.push(this@ScreenCaptureService, it.ip)
+                val cands = localIpCandidates()
+                val ip = cands.firstOrNull { it.isHotspot }?.ip ?: cands.firstOrNull()?.ip
+                if (ip != null) {
+                    RendezvousUpdater.push(this@ScreenCaptureService, ip)
                 }
                 delay(REGISTER_INTERVAL_MS)
             }

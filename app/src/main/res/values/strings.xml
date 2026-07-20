@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">TeslaMirror</string>
+    <string name="ime_watch_description">앱 모드에서 검색창 등 입력란을 감지해 테슬라 브라우저 키보드를 자동으로 띄웁니다. 개인용 미러링에만 사용됩니다.</string>
 </resources>

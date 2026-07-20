@@ -160,9 +160,12 @@ class WebRtcSession(
                 val answer = awaitAnswer(offerId)
                 if (answer == null) { closeConnection(); continue }
                 setRemote(answer)
-                val connectedOk = withTimeoutOrNull(12_000) { connected.await() } != null
+                val waitMs = if (internetPath) 18_000L else 12_000L
+                onStatus("ICE 연결 중…")
+                val connectedOk = withTimeoutOrNull(waitMs) { connected.await() } != null
                 if (!connectedOk) {
-                    Log.i(TAG, "not connected in 12s, re-offering"); closeConnection(); continue
+                    Log.i(TAG, "not connected in ${waitMs}ms, re-offering state=${pc?.connectionState()}")
+                    closeConnection(); continue
                 }
                 onStatus("연결됨")
                 awaitClosed()
@@ -171,7 +174,7 @@ class WebRtcSession(
             } finally {
                 closeConnection()
             }
-            if (running) delay(500)
+            if (running) delay(800)
         }
     }
 
@@ -191,6 +194,7 @@ class WebRtcSession(
         }
         val cfg = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            if (internetPath || advertiseIp != null) iceCandidatePoolSize = 4
         }
         pc = factory.createPeerConnection(cfg, object : PeerConnection.Observer {
             override fun onIceCandidate(candidate: IceCandidate?) {}
@@ -200,10 +204,14 @@ class WebRtcSession(
             override fun onConnectionChange(s: PeerConnection.PeerConnectionState?) {
                 Log.i(TAG, "pc=$s")
                 when (s) {
-                    PeerConnection.PeerConnectionState.CONNECTED -> c.complete(Unit)
+                    PeerConnection.PeerConnectionState.CONNECTED -> {
+                        if (!c.isCompleted) c.complete(Unit)
+                    }
+                    // DISCONNECTED 는 일시 ICE 끊김 — 즉시 세션 종료하면 연결중/재연결 깜빡임
                     PeerConnection.PeerConnectionState.FAILED,
-                    PeerConnection.PeerConnectionState.DISCONNECTED,
-                    PeerConnection.PeerConnectionState.CLOSED -> x.complete(Unit)
+                    PeerConnection.PeerConnectionState.CLOSED -> {
+                        if (!x.isCompleted) x.complete(Unit)
+                    }
                     else -> {}
                 }
             }
@@ -217,7 +225,19 @@ class WebRtcSession(
             override fun onRenegotiationNeeded() {}
             override fun onAddTrack(r: RtpReceiver?, streams: Array<out MediaStream>?) {}
         })
-        dataChannel = pc!!.createDataChannel("v", DataChannel.Init().apply { ordered = true })
+        val dc = pc!!.createDataChannel("v", DataChannel.Init().apply { ordered = true })
+        dc.registerObserver(object : DataChannel.Observer {
+            override fun onBufferedAmountChange(previousAmount: Long) {}
+            override fun onStateChange() {
+                val st = runCatching { dc.state() }.getOrNull()
+                Log.i(TAG, "dc=$st")
+                if (st == DataChannel.State.CLOSED || st == DataChannel.State.CLOSING) {
+                    if (c.isCompleted && !x.isCompleted) x.complete(Unit)
+                }
+            }
+            override fun onMessage(buffer: org.webrtc.DataChannel.Buffer?) {}
+        })
+        dataChannel = dc
     }
 
     private suspend fun createOfferAndGather(): String {
@@ -230,16 +250,18 @@ class WebRtcSession(
             }, MediaConstraints())
         }
         awaitSet("setLocal") { pc!!.setLocalDescription(it, offer) }
-        withTimeoutOrNull(5000) { gathered.await() }   // 이벤트가 먼저 왔어도 즉시 반환
+        // 유용 후보 모이면 조기 offer (최대 ~1.8s) — 첫 연결 체감 단축
+        waitForUsefulIce(needPublic = internetPath || advertiseIp != null)
         val raw = pc!!.localDescription?.description ?: offer.description
-        // 테슬라 = 핫스팟 클라이언트 + 사설 IP UDP 거부.
-        // 동일 조건 검증: internetPath 켜면 사설 후보 전부 제거(공인 srflx/relay만).
-        // 노트북도 핫스팟에 붙인 채 이 모드로 테스트해야 테슬라와 같은 경로를 본다.
-        // (사설을 남겨 노트북만 되게 하면 테슬라 검증이 아님.)
+        // internetPath: 공인(srflx) + 사설(host) 모두 유지.
+        //  - 테슬라(다른 망): 사설 실패 후 공인으로 연결
+        //  - 집 Wi-Fi 같은 LAN 노트북: 사설 host로 바로 연결 (공인 hairpin 실패 회피)
+        //  - 127.0.0.1 / 0.0.0.0 만 제거
+        // 로컬 전용(!internetPath): 사설 host 만 (예전 PC 핫스팟 디버그)
         val filtered = when {
             advertiseIp != null -> filterToLocalCandidates(raw)
-            internetPath -> filterToPublicCandidates(raw)
-            else -> filterToLocalCandidates(raw) // 로컬 전용(디버그). 테슬라 시뮬 아님
+            internetPath -> filterJunkCandidates(raw)
+            else -> filterToLocalCandidates(raw)
         }
         val hasCand = Regex("""a=candidate:""").containsMatchIn(filtered)
         if (!hasCand) {
@@ -257,6 +279,21 @@ class WebRtcSession(
         return sdp
     }
 
+    private suspend fun waitForUsefulIce(needPublic: Boolean) {
+        val deadline = System.currentTimeMillis() + 1_800L
+        while (running && System.currentTimeMillis() < deadline) {
+            if (gathered.isCompleted) return
+            val sdp = pc?.localDescription?.description.orEmpty()
+            if (needPublic) {
+                if (sdp.contains("typ srflx") || sdp.contains("typ relay")) return
+            } else if (Regex("""a=candidate:.*typ host""").containsMatchIn(sdp)) {
+                return
+            }
+            delay(50)
+        }
+        withTimeoutOrNull(100) { if (!gathered.isCompleted) gathered.await() }
+    }
+
     /** 사설 IPv4 host 후보만 남긴다(로컬 핫스팟 PC 테스트용). */
     private fun filterToLocalCandidates(sdp: String): String {
         val out = sdp.split("\r\n", "\n").map { it.trimEnd('\r') }.filter { line ->
@@ -267,12 +304,22 @@ class WebRtcSession(
         return out.joinToString("\r\n").trimEnd() + "\r\n"
     }
 
-    /** 사설 IPv4 후보를 제거(인터넷 경로). IPv6·공인 IPv4·srflx 유지. */
+    /** 사설 IPv4 후보를 제거(구 테슬라-only 검증용, 일부 경로에서 재사용). */
     private fun filterToPublicCandidates(sdp: String): String {
         val out = sdp.split("\r\n", "\n").map { it.trimEnd('\r') }.filter { line ->
             if (!line.startsWith("a=candidate:")) return@filter true
             val addr = line.removePrefix("a=").split(' ').getOrNull(4) ?: return@filter false
-            !isPrivateIpv4(addr) && addr != "0.0.0.0"
+            !isPrivateIpv4(addr) && addr != "0.0.0.0" && addr != "127.0.0.1"
+        }
+        return out.joinToString("\r\n").trimEnd() + "\r\n"
+    }
+
+    /** 루프백·무효 주소만 제거. 사설 host + 공인 srflx 동시 유지(집 LAN + 테슬라). */
+    private fun filterJunkCandidates(sdp: String): String {
+        val out = sdp.split("\r\n", "\n").map { it.trimEnd('\r') }.filter { line ->
+            if (!line.startsWith("a=candidate:")) return@filter true
+            val addr = line.removePrefix("a=").split(' ').getOrNull(4) ?: return@filter false
+            addr != "0.0.0.0" && addr != "127.0.0.1" && !addr.startsWith("192.0.0.")
         }
         return out.joinToString("\r\n").trimEnd() + "\r\n"
     }
@@ -321,12 +368,24 @@ class WebRtcSession(
 
     /** 연결이 끊길 때까지 대기. 이벤트 유실 대비로 연결 상태를 주기 확인한다. */
     private suspend fun awaitClosed() {
+        // DISCONNECTED 는 복구 가능 — 15초 이상일 때만 종료. FAILED/CLOSED 즉시 종료.
+        var disconnectedSince = 0L
         while (running) {
             val st = pc?.connectionState() ?: return
-            if (st == PeerConnection.PeerConnectionState.FAILED ||
-                st == PeerConnection.PeerConnectionState.DISCONNECTED ||
-                st == PeerConnection.PeerConnectionState.CLOSED
-            ) return
+            when (st) {
+                PeerConnection.PeerConnectionState.FAILED,
+                PeerConnection.PeerConnectionState.CLOSED -> return
+                PeerConnection.PeerConnectionState.DISCONNECTED -> {
+                    if (disconnectedSince == 0L) disconnectedSince = System.currentTimeMillis()
+                    if (System.currentTimeMillis() - disconnectedSince > 15_000L) {
+                        Log.i(TAG, "disconnected >15s, end session")
+                        return
+                    }
+                }
+                PeerConnection.PeerConnectionState.CONNECTED,
+                PeerConnection.PeerConnectionState.CONNECTING -> disconnectedSince = 0L
+                else -> {}
+            }
             withTimeoutOrNull(2000) { closed.await() }
         }
     }
@@ -358,13 +417,13 @@ class WebRtcSession(
                 val d = pc?.localDescription?.description ?: return null
                 val f = when {
                     advertiseIp != null -> filterToLocalCandidates(d)
-                    internetPath -> filterToPublicCandidates(d)
+                    internetPath -> filterJunkCandidates(d)
                     else -> filterToLocalCandidates(d)
                 }
                 postOffer(offerId, advertiseIp?.let { rewriteToAdvertiseIp(f, it) } ?: f)
                 lastRepost = now
             }
-            delay(if (now - start < 20_000) 700 else 2500)    // 접속 직후 촘촘, 이후 완화(무료 한도 절약)
+            delay(if (now - start < 15_000) 300 else 1_000) // 첫 연결 빠르게, 이후 완화
         }
         return null
     }

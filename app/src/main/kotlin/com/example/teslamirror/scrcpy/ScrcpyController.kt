@@ -17,7 +17,7 @@ import kotlin.random.Random
  *  1. assets/scrcpy-server.jar → /data/local/tmp 푸시
  *  2. shell로 서버 구동 (tunnel_forward, new_display=WxH, control=true)
  *  3. localabstract 소켓 연결: 1번째=영상, 2번째=컨트롤
- *  4. 서버 로그의 "New display: ...(id=N)" 파싱 → am start로 대상 앱 실행
+ *  4. 서버 로그의 "New display: ...(id=N)" 파싱 → am start로 런처(홈) 실행
  *  5. 영상 패킷(config/key/delta) 파싱해 콜백
  */
 class ScrcpyController(
@@ -26,13 +26,18 @@ class ScrcpyController(
     private val displayHeight: Int,
     private val dpi: Int,
     private val maxFps: Int,
-    private val targetPackage: String,
+    /** pkg/class 형태. 기본은 AppLauncherActivity (앱 선택 없이 홈 그리드). */
+    private val targetComponent: String,
     private val onConfig: (ByteArray) -> Unit,
     private val onFrame: (ByteArray, Boolean) -> Unit,
     private val onError: (String) -> Unit,
 ) {
     val videoWidth get() = displayWidth
     val videoHeight get() = displayHeight
+
+    /** scrcpy New display id — 홈 재기동(ActivityOptions)에 사용. -1=아직 없음. */
+    @Volatile var displayId: Int = -1
+        private set
 
     @Volatile private var running = false
     private var serverStream: AdbStream? = null
@@ -65,21 +70,28 @@ class ScrcpyController(
                     "settings put global enable_freeform_support 1"
             )
         }
+        // display_ime_policy=local: 가상 디스플레이에 소프트 키보드(Gboard 등)를 띄움
+        // → 미러 화면에 키보드가 그려지고 터치로 입력 (Tesor 계열과 같은 UX)
+        // (기본 fallback 이면 키보드가 폰 본화면으로 가서 테슬라에 안 보임)
+        // vd_system_decorations=false: 하단 시스템 내비/시계 바 제거
+        // (라이트 테마 흰 바 + 흰 아이콘으로 카카오맵 등에서 가독성 붕괴)
         val server = "CLASSPATH=$REMOTE_JAR app_process / com.genymobile.scrcpy.Server $SERVER_VERSION" +
             " scid=$scid log_level=info tunnel_forward=true audio=false control=true video=true" +
-            " new_display=${displayWidth}x${displayHeight}/$dpi video_codec=h264 max_fps=$maxFps"
+            " new_display=${displayWidth}x${displayHeight}/$dpi video_codec=h264 max_fps=$maxFps" +
+            " display_ime_policy=local vd_system_decorations=false"
         // Android 16: --activity-new-task / --activity-clear-task 는 미지원(Unknown option).
-        // -f 0x10008000 = NEW_TASK|CLEAR_TASK. force-stop 없이 가상 디스플레이에만 1회 기동.
-        val cmd = "comp=\$(cmd package resolve-activity --brief $targetPackage 2>/dev/null | awk '/\\// {print; exit}'); " +
-            "if [ -z \"\$comp\" ]; then comp=\$(cmd package resolve-activity --brief $targetPackage 2>/dev/null | tail -1); fi; " +
-            "echo \"COMP=\$comp PKG=$targetPackage\"; " +
+        // -f 0x10008000 = NEW_TASK|CLEAR_TASK. 가상 디스플레이에 홈(런처) 1회 기동.
+        // targetComponent 예: com.example.teslamirror/com.example.teslamirror.AppLauncherActivity
+        val comp = targetComponent.replace("'", "")
+        val cmd = "comp='$comp'; " +
+            "echo \"COMP=\$comp\"; " +
             "started=0; $server 2>&1 | while IFS= read -r line; do echo \"\$line\"; " +
             "case \"\$line\" in *\"New display:\"*) " +
             "if [ \"\$started\" = 0 ]; then started=1; " +
             "id=\$(echo \"\$line\" | grep -o 'id=[0-9]*' | cut -d= -f2); " +
             "echo \"AMSTART[\$id,\$comp]:\$(am start --display \"\$id\" -n \"\$comp\" -f 0x10008000 2>&1)\"; " +
             "fi ;; esac; done"
-        Log.i(TAG, "start server scid=$scid pkg=$targetPackage")
+        Log.i(TAG, "start server scid=$scid comp=$comp")
         serverStream = adb.openStream("shell:$cmd")
 
         logThread = Thread { readServerLog(adb, serverStream!!.openInputStream()) }.apply {
@@ -133,7 +145,18 @@ class ScrcpyController(
 
     private fun readServerLog(adb: AdbManager, input: InputStream) {
         try {
-            input.bufferedReader().forEachLine { line -> Log.i(TAG, "[server] $line") }
+            input.bufferedReader().forEachLine { line ->
+                Log.i(TAG, "[server] $line")
+                // New display: 1280x800/200 (id=32)  or AMSTART[32,...]
+                val m = DISPLAY_ID_RE.find(line)
+                if (m != null) {
+                    val id = m.groupValues[1].toIntOrNull()
+                    if (id != null && id >= 0) {
+                        displayId = id
+                        Log.i(TAG, "virtual displayId=$id")
+                    }
+                }
+            }
         } catch (_: Throwable) { /* stream closed */ }
     }
 
@@ -156,21 +179,32 @@ class ScrcpyController(
             var pktNo = 0
             while (running) {
                 readFully(input, header, 12)
+                var size = packetSize(header)
+                // 인코더 리셋·드롭 직후 프레이밍이 어긋날 수 있음 → 1바이트씩 밀어 재동기화
+                if (!isPlausiblePacketSize(size)) {
+                    val skipped = resyncHeader(input, header)
+                    size = packetSize(header)
+                    if (!isPlausiblePacketSize(size)) {
+                        throw IllegalStateException(
+                            "bad packet size $size after resync(skip=$skipped) pkt#$pktNo " +
+                                "hdr=${header.toHex()}"
+                        )
+                    }
+                    Log.w(TAG, "video resync skipped=$skipped bytes → size=$size (pkt#$pktNo)")
+                }
                 val isConfig = (header[0].toInt() and 0x80) != 0
                 val isKey = (header[0].toInt() and 0x40) != 0
-                val size = ((header[8].toInt() and 0xFF) shl 24) or
-                    ((header[9].toInt() and 0xFF) shl 16) or
-                    ((header[10].toInt() and 0xFF) shl 8) or
-                    (header[11].toInt() and 0xFF)
-                if (pktNo < 4) {
-                    Log.i(TAG, "PKT#$pktNo header=${header.joinToString(""){ "%02x".format(it) }} cfg=$isConfig key=$isKey size=$size")
+                if (pktNo < 4 || isConfig) {
+                    Log.i(
+                        TAG,
+                        "PKT#$pktNo header=${header.toHex()} cfg=$isConfig key=$isKey size=$size"
+                    )
                 }
-                if (size <= 0 || size > 20_000_000) throw IllegalStateException("bad packet size $size (pkt#$pktNo)")
                 val payload = ByteArray(size)
                 readFully(input, payload, size)
                 if (pktNo < 4) {
                     val n = minOf(12, payload.size)
-                    Log.i(TAG, "PKT#$pktNo payload[0..$n]=${payload.copyOf(n).joinToString(""){ "%02x".format(it) }}")
+                    Log.i(TAG, "PKT#$pktNo payload[0..$n]=${payload.copyOf(n).toHex()}")
                 }
                 pktNo++
                 if (isConfig) onConfig(payload) else onFrame(payload, isKey)
@@ -179,6 +213,38 @@ class ScrcpyController(
             if (running) onError("영상 스트림 종료: ${t.message}")
         }
     }
+
+    /**
+     * 헤더 12바이트가 깨졌을 때 1바이트씩 슬라이드하며 그럴듯한 size 필드를 찾는다.
+     * @return 버린 바이트 수
+     */
+    private fun resyncHeader(input: InputStream, header: ByteArray): Int {
+        var skipped = 0
+        while (skipped < MAX_RESYNC_BYTES && running) {
+            // 한 바이트 밀기
+            System.arraycopy(header, 1, header, 0, 11)
+            val b = input.read()
+            if (b < 0) throw java.io.EOFException("resync EOF")
+            header[11] = b.toByte()
+            skipped++
+            val size = packetSize(header)
+            if (!isPlausiblePacketSize(size)) continue
+            // Annex-B NAL 시작(0x00000001)이 payload 선두에 오면 더 신뢰
+            // size 만큼 미리 읽을 수 없으므로 size 범위 + (key|config 플래그 허용)으로 충분
+            return skipped
+        }
+        return skipped
+    }
+
+    private fun packetSize(header: ByteArray): Int =
+        ((header[8].toInt() and 0xFF) shl 24) or
+            ((header[9].toInt() and 0xFF) shl 16) or
+            ((header[10].toInt() and 0xFF) shl 8) or
+            (header[11].toInt() and 0xFF)
+
+    /** 정상 H.264 프레임 크기 상한(~2MB). 그 이상은 프레이밍 깨짐으로 본다. */
+    private fun isPlausiblePacketSize(size: Int): Boolean =
+        size in 1..MAX_PACKET_SIZE
 
     private fun readFully(input: InputStream, buf: ByteArray, len: Int) {
         var off = 0
@@ -194,10 +260,17 @@ class ScrcpyController(
         readFully(input, tmp, len)
     }
 
+    private fun ByteArray.toHex(): String =
+        joinToString("") { "%02x".format(it) }
+
     companion object {
         private const val TAG = "ScrcpyController"
         private const val SERVER_VERSION = "4.1"
         private const val ASSET_NAME = "scrcpy-server.jar"
         private const val REMOTE_JAR = "/data/local/tmp/scrcpy-server.jar"
+        /** 1280x800 IDR도 수백 KB 수준. 2MB 초과는 거의 항상 프레이밍 오류. */
+        private const val MAX_PACKET_SIZE = 2_000_000
+        private const val MAX_RESYNC_BYTES = 256 * 1024
+        private val DISPLAY_ID_RE = Regex("""(?:New display:.*id=|AMSTART\[)(\d+)""")
     }
 }
