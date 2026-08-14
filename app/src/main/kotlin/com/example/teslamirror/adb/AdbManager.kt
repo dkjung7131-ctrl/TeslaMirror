@@ -107,11 +107,30 @@ class AdbManager private constructor(context: Context) : AbsAdbConnectionManager
     /**
      * ADB 연결 보장.
      *  1) 무선 디버깅(mDNS 자동 탐색) — 실사용 경로
-     *  2) 실패 시 클래식 ADB over TCP(127.0.0.1:5555) — `adb tcpip 5555` 검증/폴백용
+     *  2) autoEnable=true(캐스트 경로)면: 꺼져 있을 때 무선 디버깅을 직접 켜고 재시도.
+     *     UI 상태 확인 경로는 autoEnable 없이 호출 — 구경만 하다 나가도 설정을 안 건드린다.
+     *  3) 실패 시 클래식 ADB over TCP(127.0.0.1:5555) — `adb tcpip 5555` 검증/폴백용
      */
-    fun ensureConnected(context: Context): Boolean {
+    @JvmOverloads
+    fun ensureConnected(context: Context, autoEnable: Boolean = false): Boolean {
         if (isConnected) return true
         runCatching { if (autoConnect(context, 5_000)) return true }
+        if (autoEnable && AdbWifiToggle.hasPermission(context)) {
+            AdbWifiToggle.enableIfNeeded(context)
+            // 방금 켰든, 직전 시도가 켜 두고 타임아웃했든 — 켜져 있기만 하면 재시도.
+            // (enableIfNeeded 반환값에 걸면 "켜졌지만 adbd 부팅 중"인 경우를 놓친다)
+            if (AdbWifiToggle.isWifiDebuggingOn(context)) {
+                val deadline = android.os.SystemClock.elapsedRealtime() + 10_000
+                while (true) {
+                    val remain = deadline - android.os.SystemClock.elapsedRealtime()
+                    if (remain < 2_000) break
+                    Thread.sleep(1_000)
+                    runCatching {
+                        if (autoConnect(context, (remain - 1_000).coerceAtMost(4_000))) return true
+                    }
+                }
+            }
+        }
         return runCatching { connect("127.0.0.1", 5555) }.getOrDefault(false)
     }
 

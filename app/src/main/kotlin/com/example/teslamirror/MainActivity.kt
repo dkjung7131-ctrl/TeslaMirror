@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.teslamirror.adb.AdbManager
+import com.example.teslamirror.adb.AdbWifiToggle
 import com.example.teslamirror.input.ImeWatchService
 import com.example.teslamirror.rendezvous.RendezvousUpdater
 import com.example.teslamirror.update.UpdateChecker
@@ -139,7 +140,11 @@ fun HomeScreen() {
             } else {
                 val once = adbPrefs.getBoolean("paired_once", false)
                 adbStatusText = if (once) {
-                    "자동 연결 실패 — 설정에서 「무선 디버깅」이 켜져 있는지 확인"
+                    if (AdbWifiToggle.hasPermission(context) && !AdbWifiToggle.isWifiDebuggingOn(context)) {
+                        "무선 디버깅 꺼짐 — 캐스트를 시작하면 자동으로 켭니다"
+                    } else {
+                        "자동 연결 실패 — 설정에서 「무선 디버깅」이 켜져 있는지 확인"
+                    }
                 } else {
                     "최초 1회 페어링이 필요합니다"
                 }
@@ -402,8 +407,13 @@ fun HomeScreen() {
                     )
                     if (adbConnected) {
                         Text(
-                            "포트·코드는 설정 화면을 열 때마다 바뀌지만, 한 번 페어링하면 앱이 기억합니다. " +
-                                "평소에는 「무선 디버깅」만 켜 두면 됩니다.",
+                            if (AdbWifiToggle.hasPermission(context)) {
+                                "자동 제어 활성 — 무선 디버깅이 꺼져 있어도 캐스트를 시작하면 앱이 알아서 켭니다 " +
+                                    "(앱이 켠 경우 종료 시 되돌림). 설정을 다시 만질 필요가 없습니다."
+                            } else {
+                                "포트·코드는 설정 화면을 열 때마다 바뀌지만, 한 번 페어링하면 앱이 기억합니다. " +
+                                    "평소에는 「무선 디버깅」만 켜 두면 됩니다."
+                            },
                             fontSize = 14.sp,
                             lineHeight = 20.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -529,7 +539,10 @@ fun HomeScreen() {
                                 Toast.makeText(context, "공용 접속 주소 시크릿을 먼저 저장하세요", Toast.LENGTH_LONG).show()
                             adbChecking || pairing ->
                                 Toast.makeText(context, "무선 디버깅 연결이 끝날 때까지 잠시만요", Toast.LENGTH_SHORT).show()
-                            !adbConnected -> {
+                            // 자동 켜기 가능(권한 보유 + 페어링 이력)하면 미연결이어도 시작 허용 —
+                            // 캐스트 경로(ScrcpyController)가 무선 디버깅을 켜고 연결한다.
+                            !adbConnected && !(AdbWifiToggle.hasPermission(context) &&
+                                adbPrefs.getBoolean("paired_once", false)) -> {
                                 Toast.makeText(
                                     context,
                                     "무선 디버깅 연결 필요 — 위 「다시 연결」또는 최초 페어링",

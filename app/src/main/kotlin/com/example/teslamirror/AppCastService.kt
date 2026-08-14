@@ -85,6 +85,8 @@ class AppCastService : Service() {
     private var webrtc: AppWebRtcSession? = null
     private var decoder: H264ToJpeg? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    /** 시작 세대 카운터 — 늦게 실패한 옛 시작 스레드가 새 캐스트를 정리하는 것 방지. */
+    @Volatile private var castGeneration = 0
 
     private var internetPathActive = true
     /** 런처가 홈(첫 화면)인지 — 뷰어 파이 표시 여부. */
@@ -132,6 +134,10 @@ class AppCastService : Service() {
             Log.i(TAG, "already starting/running — ignore duplicate start")
             return START_STICKY
         }
+        // 시작 세대 — 오래 블록된 시작 스레드(최대 ~20초)가 뒤늦게 실패했을 때
+        // "그 사이 새로 시작된 캐스트"를 잘못 정리하지 않도록 구분한다.
+        castGeneration += 1
+        val gen = castGeneration
 
         val modeLabel = "런처"
         // 테슬라 뷰포트 비율 학습값 → 가상 디스플레이 해상도 (fill 옵션)
@@ -195,6 +201,12 @@ class AppCastService : Service() {
                     Log.i(TAG, "viewer launcher=$onLauncher")
                 }
                 lastOnLauncher = true
+                // 직전 종료 때 앱이 무선 디버깅을 껐을 수 있음 — 여기서 켜고 연결부터 확보.
+                // (forceDarkModeForCast가 ADB를 쓰므로 연결이 먼저여야 다크모드가 실제로 적용됨)
+                runCatching {
+                    com.example.teslamirror.adb.AdbManager.getInstance(this)
+                        .ensureConnected(this, autoEnable = true)
+                }
                 // 런처/맵이 라이트 테마로 뜨면 흰 배경+흰 글자 → 가독성 붕괴.
                 // 캐스트 중에만 야간 모드 강제 (중지에 이전 값 복구).
                 forceDarkModeForCast()
@@ -229,6 +241,11 @@ class AppCastService : Service() {
                 Log.i(TAG, "started OK ${dispW}x$dispH gboard=$gboard imeWatch=${ImeWatchService.isEnabled(this@AppCastService)}")
             } catch (t: Throwable) {
                 Log.e(TAG, "start failed", t)
+                if (gen != castGeneration) {
+                    // 그 사이 사용자가 중지→재시작함 — 새 캐스트를 건드리면 안 됨
+                    Log.i(TAG, "stale start thread (gen=$gen) — skip teardown")
+                    return@Thread
+                }
                 // 실패 시 빨간 중지 → 다시 시작 버튼 + 실패 문구
                 stopEverything(clearStatus = false)
                 publishUi(running = false, status = "시작 실패: ${t.message}")
@@ -466,7 +483,13 @@ class AppCastService : Service() {
         runCatching { decoder?.stop() }
         runCatching { webrtc?.stop() }
         controller = null; decoder = null; webrtc = null
-        restoreDarkModeAfterCast()
+        // restoreDarkModeAfterCast는 ADB 소켓 I/O — 메인 스레드(중지 버튼/onDestroy 경로)에서
+        // 직접 부르면 NetworkOnMainThreadException으로 조용히 실패한다. 꼬리 작업을 스레드로:
+        // ① 다크모드 복원(살아있는 adbd 필요) → ② 앱이 켠 무선 디버깅 되돌리기 — 순서 고정.
+        Thread {
+            runCatching { restoreDarkModeAfterCast() }
+            runCatching { com.example.teslamirror.adb.AdbWifiToggle.disableIfEnabledByApp(this) }
+        }.apply { isDaemon = true; name = "AppCastStopTail" }.start()
         if (clearStatus) {
             publishUi(running = false, status = "")
         } else {

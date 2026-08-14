@@ -52,7 +52,7 @@ class ScrcpyController(
     fun start() {
         running = true
         val adb = AdbManager.getInstance(context)
-        check(adb.ensureConnected(context)) { "ADB 연결 실패 — 무선 디버깅/페어링을 확인하세요" }
+        check(adb.ensureConnected(context, autoEnable = true)) { "ADB 연결 실패 — 무선 디버깅/페어링을 확인하세요" }
 
         // 1) 서버 푸시
         val jar = context.assets.open(ASSET_NAME).use { it.readBytes() }
