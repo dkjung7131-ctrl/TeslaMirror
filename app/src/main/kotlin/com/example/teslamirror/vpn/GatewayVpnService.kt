@@ -369,13 +369,10 @@ class GatewayVpnService : VpnService() {
         }
 
         fun stop(context: Context) {
-            // startForegroundService로 보내야 이미 FGS인 서비스가 STOP을 받음
-            val i = Intent(context, GatewayVpnService::class.java).apply { action = ACTION_STOP }
-            try {
-                context.startForegroundService(i)
-            } catch (_: Throwable) {
-                context.startService(i)
-            }
+            // stopService: 떠있으면 onDestroy→teardown으로 정리, 없으면 no-op.
+            // startForegroundService(STOP)는 미기동 서비스를 깨웠다가 startForeground 없이
+            // stopSelf하게 만들어 ForegroundServiceDidNotStartInTimeException으로 앱 전체가 죽는다.
+            runCatching { context.stopService(Intent(context, GatewayVpnService::class.java)) }
         }
     }
 }

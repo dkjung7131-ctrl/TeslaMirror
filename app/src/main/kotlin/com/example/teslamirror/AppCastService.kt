@@ -73,7 +73,10 @@ class AppCastService : Service() {
             try {
                 context.startService(i)
             } catch (_: Throwable) {
-                context.startForegroundService(i)
+                // 백그라운드에서 startService가 막히면 stopService로 직접 종료.
+                // startForegroundService(STOP)는 startForeground 없이 stopSelf하는 경로라
+                // ForegroundServiceDidNotStartInTimeException 위험이 있다.
+                runCatching { context.stopService(Intent(context, AppCastService::class.java)) }
             }
         }
     }
